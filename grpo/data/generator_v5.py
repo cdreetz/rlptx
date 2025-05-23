@@ -22,6 +22,7 @@ def get_client():
 client = get_client()
 
 
+
 @dataclass
 class KernelSpec:
     operation: str
@@ -43,6 +44,7 @@ class CompletionProvider:
             ],
         )
         return response.choices[0].message.content
+
 
 
 class TritonDataGenerator:
@@ -170,13 +172,17 @@ Provide only the kernel code without explanation."""
         # If no code blocks, return the whole response
         return response.strip()
 
-    def test_kernel_compilation(self, kernel_code: str) -> Tuple[bool, str]:
-        """Test if kernel code compiles with Triton"""
+    def test_kernel_compilation(self, kernel_code: str, input_shapes: List[Tuple], output_shape: Tuple) -> Tuple[bool, str]:
+        """Test if kernel code compiles and runs using triton.testing.do_bench"""
         try:
             import tempfile
             import os
             import sys
             import importlib.util
+
+            # Quick check - must contain @triton.jit
+            if '@triton.jit' not in kernel_code:
+                return False, "No @triton.jit decorator found in code"
 
             # Write kernel code to temporary file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
@@ -188,42 +194,82 @@ Provide only the kernel code without explanation."""
                 spec = importlib.util.spec_from_file_location("temp_kernel", temp_file)
                 module = importlib.util.module_from_spec(spec)
 
-                # Add required imports to module namespace before execution
+                # Add required imports to module namespace
                 import builtins
                 module.__builtins__ = builtins
+                module.triton = triton
+                module.tl = triton.language
+                module.torch = torch
                 sys.modules['temp_kernel'] = module
 
+                # Execute the module
                 spec.loader.exec_module(module)
 
-                # Find any function that looks like a kernel
+                # Find kernel function
                 kernel_func = None
                 for name in dir(module):
                     if not name.startswith('_'):
                         obj = getattr(module, name)
                         if callable(obj) and hasattr(obj, '__name__'):
-                            # Check if it's defined in our module (not imported)
                             if hasattr(obj, '__module__') and obj.__module__ == 'temp_kernel':
                                 kernel_func = obj
                                 break
 
                 if kernel_func is None:
-                    return False, "No kernel function found in module"
+                    return False, "No function found in module"
 
-                return True, f"Found kernel function: {kernel_func.__name__}"
+                # Create dummy tensors based on input/output shapes
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                inputs = [torch.randn(shape, device=device, dtype=torch.float32) for shape in input_shapes]
+                output = torch.empty(output_shape, device=device, dtype=torch.float32)
+
+                # Determine grid size and block size based on shapes
+                if len(output_shape) == 1:  # 1D output (elementwise or reduction)
+                    N = output_shape[0]
+                    BLOCK_SIZE = 256
+                    grid = (triton.cdiv(N, BLOCK_SIZE),)
+                    args = (*inputs, output, N, BLOCK_SIZE)
+                elif len(output_shape) == 2:  # 2D output (matmul)
+                    M, N = output_shape
+                    if len(input_shapes) == 2 and len(input_shapes[0]) == 2:  # Likely matmul
+                        K = input_shapes[0][1]
+                        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 64, 32
+                        grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+                        # Matmul args: A, B, C, M, N, K, strides...
+                        args = (*inputs, output, M, N, K,
+                               inputs[0].stride(0), inputs[0].stride(1),
+                               inputs[1].stride(0), inputs[1].stride(1),
+                               output.stride(0), output.stride(1),
+                               BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+                    else:  # 2D reduction
+                        M, N = input_shapes[0]
+                        BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 32
+                        grid = (triton.cdiv(M, BLOCK_SIZE_M),)
+                        args = (*inputs, output, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
+                else:
+                    return False, "Unsupported tensor dimensionality"
+
+                # Use triton.do_bench to test compilation and execution
+                def benchmark_fn():
+                    kernel_func[grid](*args)
+
+                # Run benchmark - if this succeeds, kernel compiles and runs
+                _ = triton.testing.do_bench(benchmark_fn, warmup=1, rep=1)
+
+                return True, f"Kernel '{kernel_func.__name__}' successfully benchmarked"
+
+            except Exception as e:
+                return False, f"Benchmark failed: {str(e)}"
 
             finally:
-                # Clean up temp file and module
+                # Clean up
                 if 'temp_kernel' in sys.modules:
                     del sys.modules['temp_kernel']
                 if os.path.exists(temp_file):
                     os.unlink(temp_file)
 
-        except SyntaxError as e:
-            return False, f"Syntax error: {str(e)}"
         except Exception as e:
-            return False, f"Error: {str(e)}"
-
-
+            return False, f"Setup error: {str(e)}"
 
     def generate_dataset(self, num_elementwise: int = 100, num_reduction: int = 50,
                         num_matmul: int = 30) -> List[Dict]:
@@ -243,7 +289,7 @@ Provide only the kernel code without explanation."""
             response = self.completion_provider.complete(prompt)
             kernel_code = self.extract_kernel_code(response)
 
-            compiles, error_msg = self.test_kernel_compilation(kernel_code)
+            compiles, error_msg = self.test_kernel_compilation(kernel_code, spec.input_shapes, spec.output_shape)
 
             dataset.append({
                 'prompt': prompt,
@@ -272,8 +318,8 @@ if __name__ == "__main__":
     generator = TritonDataGenerator(provider)
 
     # Generate small test dataset
-    dataset = generator.generate_dataset(num_elementwise=2, num_reduction=2, num_matmul=2)
-    generator.save_dataset(dataset, "triton_kernels_dataset.json")
+    dataset = generator.generate_dataset(num_elementwise=3, num_reduction=3, num_matmul=3)
+    generator.save_dataset(dataset, "triton_kernels_dataset_v5.json")
 
     # Print compilation stats
     compiled = sum(1 for item in dataset if item['compiles'])
