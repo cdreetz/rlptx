@@ -1,27 +1,26 @@
 """
-Abstract base class and implementations for reward computation in RL training.
+Triton Kernel Reward Evaluator for GRPO training.
+
+Implements the 3-part reward system:
+- 2.0 points: Kernel compiles successfully
+- 1.0 points: Kernel produces correct output vs PyTorch baseline
+- 0.5 points: Kernel includes requested optimizations
 """
 
 import re
-import os
 import torch
+import triton
+import triton.language as tl
 import tempfile
-import subprocess
+import os
+import sys
+import importlib.util
 from abc import ABC, abstractmethod
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
+
 
 class RewardEvaluator(ABC):
-    """
-    Abstract base class for reward computation in RL training.
-    
-    This class defines the interface for reward evaluators that can be used
-    to score model completions during RL training. Implement this class to
-    create custom reward functions for different tasks.
-    
-    The main methods that need to be implemented are:
-    - compute_rewards: Computes rewards for a batch of completions
-    - get_reward_breakdown: Converts raw reward scores to a labeled dictionary
-    """
+    """Abstract base class for reward computation in RL training."""
     
     @abstractmethod
     def compute_rewards(
@@ -31,389 +30,333 @@ class RewardEvaluator(ABC):
         answer: Any,
         device: str
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute rewards for a batch of completions.
-        
-        Args:
-            prompts: List of prompt messages in chat format
-                    [{"role": "user", "content": "..."}, ...]
-            completions: List of completion messages in chat format
-                        [{"role": "assistant", "content": "..."}, ...]
-            answer: Ground truth answer(s) for the prompts
-            device: Device to place tensors on ("cpu" or "cuda")
-            
-        Returns:
-            rewards_per_func: Tensor of shape (num_completions, num_reward_functions)
-                            containing individual reward function scores
-            metrics: Dictionary of aggregated metrics including mean rewards
-                    per function and total reward
-        """
+        """Compute rewards for a batch of completions."""
         pass
 
     @abstractmethod
     def get_reward_breakdown(self, reward_scores: torch.Tensor) -> Dict[str, float]:
-        """
-        Convert raw reward scores tensor to a labeled dictionary.
-        
-        Args:
-            reward_scores: Tensor of raw scores from compute_rewards
-            
-        Returns:
-            Dictionary mapping reward function names to their scores
-        """
+        """Convert raw reward scores tensor to a labeled dictionary."""
         pass
 
 
-class TritonEvaluator(RewardEvaluator):
+class TritonKernelEvaluator(RewardEvaluator):
     """
     Reward evaluator for Triton kernel generation.
     
-    Implements reward functions for:
-    - Code compilation
-    - Functional correctness
-    - Performance (if available)
+    Implements 3 reward functions:
+    1. Compilation (2.0): Does the kernel compile and run?
+    2. Correctness (1.0): Does output match PyTorch baseline?
+    3. Optimizations (0.5): Does kernel include requested optimizations?
     """
     
-    def __init__(self, can_run_triton: bool = False):
-        """
-        Initialize the TritonEvaluator.
-        
-        Args:
-            can_run_triton: Whether Triton is available for actual compilation
-        """
+    def __init__(self):
         self.num_reward_functions = 3
-        self.can_run_triton = can_run_triton
-        
-        # Try to import triton if available
-        self.triton_available = False
-        if self.can_run_triton:
-            try:
-                import triton
-                self.triton = triton
-                self.triton_available = True
-            except ImportError:
-                print("Warning: Triton not available. Using fallback evaluation.")
     
-    def _extract_code(self, text: str) -> str:
-        """
-        Extract code from the model's response, ignoring explanations.
+    def _extract_kernel_code(self, response: str) -> Optional[str]:
+        """Extract kernel code from model response."""
+        # Look for code blocks
+        if "```python" in response:
+            start = response.find("```python") + len("```python")
+            end = response.find("```", start)
+            if end != -1:
+                return response[start:end].strip()
+        elif "```" in response:
+            start = response.find("```") + 3
+            end = response.find("```", start)
+            if end != -1:
+                return response[start:end].strip()
         
-        Args:
-            text: Model response text
-            
-        Returns:
-            Extracted code
-        """
-        # code block
-        code_block_match = re.search(r'```(?:python|triton)?\s*(.*?)```', text, re.DOTALL)
-        if code_block_match:
-            return code_block_match.group(1).strip()
-        
-        # If no code block, try to extract just the code part
-        # Look for import statements as starting points
-        import_match = re.search(r'(import\s+triton.*?)$', text, re.DOTALL)
-        if import_match:
-            return import_match.group(1).strip()
-        
-        # If all else fails, return the entire text (might be just code)
-        return text.strip()
+        # If no code blocks, return the whole response
+        return response.strip()
     
-    def _compilation_reward(self, completions: List[List[Dict[str, str]]]) -> List[float]:
-        """
-        Reward for successful kernel compilation.
-        
-        Args:
-            completions: Model completions
-            
-        Returns:
-            List of reward values
-        """
-        responses = [completion[0]['content'] for completion in completions]
-        extracted = [self._extract_code(r) for r in responses]
-        
-        rewards = []
-        
-        for code in extracted:
-            if self.triton_available:
-                # Attempt actual compilation
-                reward = self._try_compile_kernel(code)
-            else:
-                # Fallback: Basic syntax check and pattern recognition
-                reward = self._syntax_check(code)
-                
-            rewards.append(reward)
-            
-        return rewards
-    
-    def _try_compile_kernel(self, code: str) -> float:
-        """
-        Try to actually compile the kernel using Triton.
-        
-        Args:
-            code: The kernel code to compile
-            
-        Returns:
-            Reward value between 0 and 1
-        """
-        # Write code to a temporary file
-        temp_filename = None
+    def _test_kernel_compilation(self, kernel_code: str, input_shapes: List[Tuple], output_shape: Tuple) -> Tuple[bool, str, Optional[callable]]:
+        """Test if kernel code compiles and runs using triton.do_bench."""
         try:
-            with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as temp_file:
-                temp_filename = temp_file.name
-                # Add necessary imports if not present
-                if "import triton" not in code:
-                    temp_file.write("import triton\n")
-                if "import triton.language" not in code and "from triton.language" not in code:
-                    temp_file.write("import triton.language as tl\n")
-                temp_file.write(code)
+            # Quick check - must contain @triton.jit
+            if '@triton.jit' not in kernel_code:
+                return False, "No @triton.jit decorator found in code", None
             
-            # Run the file to check for compilation
+            # Write kernel code to temporary file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                f.write(kernel_code)
+                temp_file = f.name
+            
             try:
-                result = subprocess.run(
-                    ['python', temp_filename],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=5
-                )
+                # Load module from file
+                spec = importlib.util.spec_from_file_location("temp_kernel", temp_file)
+                module = importlib.util.module_from_spec(spec)
                 
-                # Check if there were errors
-                if result.returncode != 0:
-                    # Analyze error type
-                    stderr = result.stderr.decode('utf-8')
-                    
-                    # Give partial credit for different error types
-                    if "SyntaxError" in stderr:
-                        return 0.0  # Syntax error
-                    elif "AttributeError" in stderr:
-                        return 0.1  # Attribute error (e.g., wrong function names)
-                    elif "TypeError" in stderr:
-                        return 0.3  # Type error (wrong argument types)
-                    else:
-                        return 0.1  # Other errors
+                # Add required imports to module namespace
+                import builtins
+                module.__builtins__ = builtins
+                module.triton = triton
+                module.tl = triton.language
+                module.torch = torch
+                sys.modules['temp_kernel'] = module
+                
+                # Execute the module
+                spec.loader.exec_module(module)
+                
+                # Find kernel function
+                kernel_func = None
+                for name in dir(module):
+                    if not name.startswith('_'):
+                        obj = getattr(module, name)
+                        if callable(obj) and hasattr(obj, '__name__'):
+                            if hasattr(obj, '__module__') and obj.__module__ == 'temp_kernel':
+                                kernel_func = obj
+                                break
+                
+                if kernel_func is None:
+                    return False, "No function found in module", None
+                
+                # Create dummy tensors based on input/output shapes
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                inputs = [torch.randn(shape, device=device, dtype=torch.float32) for shape in input_shapes]
+                output = torch.empty(output_shape, device=device, dtype=torch.float32)
+                
+                # Determine grid size and block size based on shapes
+                if len(output_shape) == 1:  # 1D output (elementwise or reduction)
+                    N = output_shape[0]
+                    BLOCK_SIZE = 256
+                    grid = (triton.cdiv(N, BLOCK_SIZE),)
+                    args = (*inputs, output, N, BLOCK_SIZE)
+                elif len(output_shape) == 2:  # 2D output (matmul)
+                    M, N = output_shape
+                    if len(input_shapes) == 2 and len(input_shapes[0]) == 2:  # Likely matmul
+                        K = input_shapes[0][1]
+                        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 64, 32
+                        grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+                        # Matmul args: A, B, C, M, N, K, strides...
+                        args = (*inputs, output, M, N, K, 
+                               inputs[0].stride(0), inputs[0].stride(1),
+                               inputs[1].stride(0), inputs[1].stride(1), 
+                               output.stride(0), output.stride(1),
+                               BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+                    else:  # 2D reduction
+                        M, N = input_shapes[0]
+                        BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 32
+                        grid = (triton.cdiv(M, BLOCK_SIZE_M),)
+                        args = (*inputs, output, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
                 else:
-                    return 1.0  # Successful compilation
+                    return False, "Unsupported tensor dimensionality", None
+                
+                # Use triton.do_bench to test compilation and execution
+                def benchmark_fn():
+                    kernel_func[grid](*args)
+                
+                # Run benchmark - if this succeeds, kernel compiles and runs
+                _ = triton.do_bench(benchmark_fn, warmup=1, rep=1)
+                
+                return True, f"Kernel '{kernel_func.__name__}' successfully benchmarked", kernel_func
+                
+            except Exception as e:
+                return False, f"Benchmark failed: {str(e)}", None
+                
+            finally:
+                # Clean up
+                if 'temp_kernel' in sys.modules:
+                    del sys.modules['temp_kernel']
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
                     
-            except subprocess.TimeoutExpired:
-                return 0.4  # Took too long but might be partially correct
+        except Exception as e:
+            return False, f"Setup error: {str(e)}", None
+    
+    def _test_correctness(self, kernel_func: callable, input_shapes: List[Tuple], output_shape: Tuple, operation: str) -> Tuple[bool, str]:
+        """Test if kernel produces correct output compared to PyTorch baseline."""
+        try:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            
+            # Generate test inputs
+            inputs = [torch.randn(shape, device=device, dtype=torch.float32) for shape in input_shapes]
+            kernel_output = torch.empty(output_shape, device=device, dtype=torch.float32)
+            
+            # Run kernel (reuse benchmark setup from compilation test)
+            if len(output_shape) == 1:  # 1D output
+                N = output_shape[0]
+                BLOCK_SIZE = 256
+                grid = (triton.cdiv(N, BLOCK_SIZE),)
+                kernel_func[grid](*inputs, kernel_output, N, BLOCK_SIZE)
+            elif len(output_shape) == 2:  # 2D output
+                M, N = output_shape
+                if len(input_shapes) == 2 and len(input_shapes[0]) == 2:  # Matmul
+                    K = input_shapes[0][1]
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 64, 32
+                    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+                    kernel_func[grid](*inputs, kernel_output, M, N, K,
+                                    inputs[0].stride(0), inputs[0].stride(1),
+                                    inputs[1].stride(0), inputs[1].stride(1),
+                                    kernel_output.stride(0), kernel_output.stride(1),
+                                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+                else:  # 2D reduction
+                    M, N = input_shapes[0]
+                    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 32
+                    grid = (triton.cdiv(M, BLOCK_SIZE_M),)
+                    kernel_func[grid](*inputs, kernel_output, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N)
+            
+            # Compute PyTorch reference
+            if operation in ['add', 'subtract', 'multiply', 'divide']:
+                if operation == 'add':
+                    reference = inputs[0] + inputs[1]
+                elif operation == 'subtract':
+                    reference = inputs[0] - inputs[1]
+                elif operation == 'multiply':
+                    reference = inputs[0] * inputs[1]
+                elif operation == 'divide':
+                    reference = inputs[0] / inputs[1]
+            elif operation in ['relu', 'gelu', 'sigmoid']:
+                if operation == 'relu':
+                    reference = torch.relu(inputs[0])
+                elif operation == 'gelu':
+                    reference = torch.nn.functional.gelu(inputs[0])
+                elif operation == 'sigmoid':
+                    reference = torch.sigmoid(inputs[0])
+            elif operation.endswith('_reduction'):
+                base_op = operation.replace('_reduction', '')
+                if base_op == 'sum':
+                    reference = torch.sum(inputs[0], dim=-1)
+                elif base_op == 'max':
+                    reference = torch.max(inputs[0], dim=-1)[0]
+                elif base_op == 'min':
+                    reference = torch.min(inputs[0], dim=-1)[0]
+                elif base_op == 'mean':
+                    reference = torch.mean(inputs[0], dim=-1)
+            elif operation == 'matmul':
+                reference = torch.matmul(inputs[0], inputs[1])
+            else:
+                return False, f"Unknown operation: {operation}"
+            
+            # Compare outputs with tolerance
+            if torch.allclose(kernel_output, reference, rtol=1e-4, atol=1e-4):
+                return True, "Outputs match PyTorch reference"
+            else:
+                max_diff = torch.max(torch.abs(kernel_output - reference)).item()
+                return False, f"Output mismatch, max diff: {max_diff:.6f}"
                 
         except Exception as e:
-            print(f"Error testing compilation: {e}")
-            return 0.0
-        finally:
-            # Clean up
-            if temp_filename and os.path.exists(temp_filename):
-                os.unlink(temp_filename)
+            return False, f"Correctness test failed: {str(e)}"
     
-    def _syntax_check(self, code: str) -> float:
-        """
-        Fallback method to check syntax when Triton is not available.
+    def _test_optimizations(self, kernel_code: str, optimization_level: str) -> Tuple[bool, str]:
+        """Test if kernel includes requested optimizations."""
+        if optimization_level == 'none':
+            return True, "No optimizations requested"
         
-        Args:
-            code: The kernel code to check
-            
-        Returns:
-            Reward value between 0 and 1
-        """
-        # Check for basic Python syntax
-        try:
-            compile(code, '<string>', 'exec')
-            syntax_correct = True
-        except SyntaxError:
-            syntax_correct = False
-            
-        # Check for necessary Triton components
-        has_triton_import = "import triton" in code
-        has_language_import = "triton.language" in code or "import triton.language" in code
-        has_decorator = "@triton.jit" in code
-        has_kernel_function = bool(re.search(r'def\s+\w+\s*\(', code))
-        has_memory_ops = "tl.load" in code and "tl.store" in code
+        optimization_keywords = {
+            'basic': ['BLOCK_SIZE', 'mask', 'tl.load', 'tl.store'],
+            'advanced': ['shared_memory', 'tile', 'vectorization', 'coalesced']
+        }
         
-        # Calculate score based on presence of key components
-        score = 0.0
-        if syntax_correct:
-            score += 0.5
-        if has_triton_import and has_language_import:
-            score += 0.1
-        if has_decorator:
-            score += 0.1
-        if has_kernel_function:
-            score += 0.1
-        if has_memory_ops:
-            score += 0.2
-            
-        return min(score, 1.0)
+        keywords = optimization_keywords.get(optimization_level, [])
+        found_keywords = [kw for kw in keywords if kw in kernel_code]
+        
+        if optimization_level == 'basic':
+            # For basic optimizations, require at least 3/4 keywords
+            if len(found_keywords) >= 3:
+                return True, f"Found optimization keywords: {found_keywords}"
+            else:
+                return False, f"Missing optimization keywords, found: {found_keywords}"
+        elif optimization_level == 'advanced':
+            # For advanced optimizations, require at least 2/4 keywords
+            if len(found_keywords) >= 2:
+                return True, f"Found optimization keywords: {found_keywords}"
+            else:
+                return False, f"Missing optimization keywords, found: {found_keywords}"
+        
+        return False, "Unknown optimization level"
     
-    def _functional_correctness(self, completions: List[List[Dict[str, str]]], reference_kernels: List[str]) -> List[float]:
-        """
-        Reward for functional correctness.
-        
-        Args:
-            completions: Model completions
-            reference_kernels: Reference kernel implementations
-            
-        Returns:
-            List of reward values
-        """
-        if self.triton_available:
-            # This would execute kernels and compare outputs
-            # For now, return a simplified check
-            return self._structural_similarity(completions, reference_kernels)
-        else:
-            # Fallback to structural similarity
-            return self._structural_similarity(completions, reference_kernels)
-    
-    def _structural_similarity(self, completions: List[List[Dict[str, str]]], reference_kernels: List[str]) -> List[float]:
-        """
-        Measure structural similarity between generated and reference kernels.
-        
-        Args:
-            completions: Model completions
-            reference_kernels: Reference implementations
-            
-        Returns:
-            Similarity scores
-        """
-        responses = [completion[0]['content'] for completion in completions]
-        extracted = [self._extract_code(r) for r in responses]
-        
-        rewards = []
-        
-        for code, ref_kernel in zip(extracted, reference_kernels):
-            # Clean whitespace and comments
-            code_clean = re.sub(r'#.*$', '', code, flags=re.MULTILINE)
-            code_clean = re.sub(r'\s+', ' ', code_clean).strip()
-            
-            ref_clean = re.sub(r'#.*$', '', ref_kernel, flags=re.MULTILINE)
-            ref_clean = re.sub(r'\s+', ' ', ref_clean).strip()
-            
-            # Extract function signature pattern
-            code_sig = re.search(r'def\s+\w+\s*\([^)]*\)', code_clean)
-            ref_sig = re.search(r'def\s+\w+\s*\([^)]*\)', ref_clean)
-            
-            # Extract triton-specific functions used
-            code_funcs = set(re.findall(r'tl\.\w+', code_clean))
-            ref_funcs = set(re.findall(r'tl\.\w+', ref_clean))
-            
-            # Calculate scores
-            signature_score = 0.0
-            if code_sig and ref_sig:
-                # Count matching parameter names
-                code_params = re.findall(r'[\w_]+(?=\s*[,:])', code_sig.group(0))
-                ref_params = re.findall(r'[\w_]+(?=\s*[,:])', ref_sig.group(0))
-                
-                if ref_params:
-                    matches = sum(1 for p in code_params if p in ref_params)
-                    signature_score = min(matches / len(ref_params), 1.0) * 0.5
-            
-            # Function usage score
-            func_score = 0.0
-            if ref_funcs:
-                matches = len(code_funcs.intersection(ref_funcs))
-                func_score = min(matches / len(ref_funcs), 1.0) * 0.5
-            
-            # Combined score
-            similarity = signature_score + func_score
-            rewards.append(min(similarity, 1.0))
-            
-        return rewards
-    
-    def _performance_reward(self, completions: List[List[Dict[str, str]]], reference_kernels: List[str]) -> List[float]:
-        """
-        Reward for kernel performance (placeholder).
-        
-        Args:
-            completions: Model completions
-            reference_kernels: Reference kernel implementations
-            
-        Returns:
-            List of performance reward values
-        """
-        # Real implementation would benchmark kernels
-        # For now, return neutral scores
-        return [0.0] * len(completions)
-
     def compute_rewards(
         self,
         prompts: List[List[Dict[str, str]]],
         completions: List[List[Dict[str, str]]],
-        answer: Any,  # Reference kernel implementations
+        answer: Any,  # answer should be dict with 'input_shapes', 'output_shape', 'operation', 'optimization_level'
         device: str
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute rewards for generated Triton kernels.
+        """Compute all rewards for the given completions."""
         
-        Args:
-            prompts: List of prompt messages in chat format
-            completions: List of completion messages in chat format
-            answer: Reference Triton kernel implementations
-            device: Device to place tensors on
-            
-        Returns:
-            rewards_per_func: Tensor of shape (num_completions, num_reward_functions)
-            metrics: Dictionary of aggregated metrics
-        """
         num_completions = len(completions)
         rewards_per_func = torch.zeros(num_completions, self.num_reward_functions, device=device)
-
-        # Compute all reward functions
-        all_scores = [
-            self._compilation_reward(completions),
-            self._functional_correctness(completions, answer),
-            self._performance_reward(completions, answer)
-        ]
+        
+        # Extract kernel specs from answer
+        input_shapes = answer['input_shapes']
+        output_shape = answer['output_shape']
+        operation = answer['operation']
+        optimization_level = answer['optimization_level']
+        
+        compilation_scores = []
+        correctness_scores = []
+        optimization_scores = []
+        
+        for i, completion in enumerate(completions):
+            response_text = completion[0]['content']
+            kernel_code = self._extract_kernel_code(response_text)
+            
+            if not kernel_code:
+                compilation_scores.append(0.0)
+                correctness_scores.append(0.0)
+                optimization_scores.append(0.0)
+                continue
+            
+            # Test compilation (2.0 points)
+            compiles, compile_msg, kernel_func = self._test_kernel_compilation(
+                kernel_code, input_shapes, output_shape
+            )
+            compilation_scores.append(2.0 if compiles else 0.0)
+            
+            # Test correctness (1.0 points) - only if compilation succeeded
+            if compiles and kernel_func:
+                correct, correct_msg = self._test_correctness(
+                    kernel_func, input_shapes, output_shape, operation
+                )
+                correctness_scores.append(1.0 if correct else 0.0)
+            else:
+                correctness_scores.append(0.0)
+            
+            # Test optimizations (0.5 points)
+            optimized, opt_msg = self._test_optimizations(kernel_code, optimization_level)
+            optimization_scores.append(0.5 if optimized else 0.0)
         
         # Fill rewards tensor
-        for i, scores in enumerate(all_scores):
-            rewards_per_func[:, i] = torch.tensor(scores, dtype=torch.float32, device=device)
+        rewards_per_func[:, 0] = torch.tensor(compilation_scores, dtype=torch.float32, device=device)
+        rewards_per_func[:, 1] = torch.tensor(correctness_scores, dtype=torch.float32, device=device)
+        rewards_per_func[:, 2] = torch.tensor(optimization_scores, dtype=torch.float32, device=device)
         
         # Compute metrics
         reward_per_func = rewards_per_func.mean(0)
         
-        # Calculate compile_success_rate (main success metric)
-        compile_scores = rewards_per_func[:, 0]  # First reward function is compilation
-        num_compiled = (compile_scores > 0.9).sum().item()  # Count successful compilations
-        compile_rate = num_compiled / num_completions
+        # Calculate success rates
+        num_compiled = (rewards_per_func[:, 0] > 0).sum().item()
+        num_correct = (rewards_per_func[:, 1] > 0).sum().item()
+        num_optimized = (rewards_per_func[:, 2] > 0).sum().item()
+        
+        compilation_rate = num_compiled / num_completions
+        correctness_rate = num_correct / num_completions
+        optimization_rate = num_optimized / num_completions
         
         metrics = {
-            "rewards/compilation": reward_per_func[0].item(),
-            "rewards/correctness": reward_per_func[1].item(),
-            "rewards/performance": reward_per_func[2].item(),
+            "rewards/compilation_reward_func": reward_per_func[0].item(),
+            "rewards/correctness_reward_func": reward_per_func[1].item(),
+            "rewards/optimization_reward_func": reward_per_func[2].item(),
             "reward": rewards_per_func.sum(dim=1).mean().item(),
-            "compile_success_rate": compile_rate,
+            "compilation_rate": compilation_rate,
+            "correctness_rate": correctness_rate,
+            "optimization_rate": optimization_rate
         }
         
         return rewards_per_func, metrics
-
+    
     def get_reward_breakdown(self, reward_scores: torch.Tensor) -> Dict[str, float]:
         """Convert reward scores tensor to labeled dictionary."""
         return {
             'compilation': reward_scores[0].item(),
             'correctness': reward_scores[1].item(),
-            'performance': reward_scores[2].item()
+            'optimization': reward_scores[2].item()
         }
 
 
 def get_evaluator(name: str) -> RewardEvaluator:
-    """
-    Get the appropriate reward evaluator for a given task.
-    
-    Args:
-        name: Name of the task/dataset to get evaluator for
-        
-    Returns:
-        RewardEvaluator instance for the specified task
-        
-    Raises:
-        NotImplementedError: If evaluator for given task is not implemented
-    """
-    if name.lower() in ["triton", "kernelbook"]:
-        # Check if Triton is available
-        try:
-            import triton
-            print("Triton is available - will use for compilation testing")
-            return TritonEvaluator(can_run_triton=True)
-        except ImportError:
-            print("Triton not available - using fallback evaluation")
-            return TritonEvaluator(can_run_triton=False)
+    """Get the appropriate reward evaluator for a given task."""
+    if name.lower() == "triton_kernels":
+        return TritonKernelEvaluator()
     else:
         raise NotImplementedError(f"No evaluator implemented for {name}")

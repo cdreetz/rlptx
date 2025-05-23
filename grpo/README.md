@@ -1,14 +1,16 @@
 # Data
 
-- mix of kernelbench and generated kernels for same algo
+- ~mix of kernelbench and generated kernels for same algo~
+- instead using full synth kernels checked with do_bench
 
 # Rewards
 
-- 2.0 compiles and correct against cpu version
-- 1.0 flops above avg or baseline
-- -1.0 non compile
+- 2.0 compiles 
+- 1.0 accurate
+- 0.5 applies optimization methods
 
 - reward for min loc?
+- perf rewards against benchmark
 - reward for utilizing key optimization methods
 
 # Utils
