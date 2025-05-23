@@ -1,4 +1,4 @@
-// benchmark_gemm.cu
+/ benchmark_gemm.cu
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <stdio.h>

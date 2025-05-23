@@ -21,6 +21,7 @@ def get_client():
 
 client = get_client()
 
+
 @dataclass
 class KernelSpec:
     operation: str
@@ -42,8 +43,6 @@ class CompletionProvider:
             ],
         )
         return response.choices[0].message.content
-
-
 
 
 class TritonDataGenerator:
@@ -171,51 +170,58 @@ Provide only the kernel code without explanation."""
         # If no code blocks, return the whole response
         return response.strip()
 
-
     def test_kernel_compilation(self, kernel_code: str) -> Tuple[bool, str]:
         """Test if kernel code compiles with Triton"""
         try:
             import tempfile
             import os
             import sys
-            from types import ModuleType
+            import importlib.util
 
-            # Create a temporary module
-            temp_module = ModuleType("temp_kernel")
-            temp_module.__dict__.update({
-                'triton': triton,
-                'tl': triton.language,
-                'torch': torch
-            })
+            # Write kernel code to temporary file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+                f.write(kernel_code)
+                temp_file = f.name
 
-            # Execute the kernel code in the temporary module
-            exec(kernel_code, temp_module.__dict__)
-
-            # Find the kernel function (should be decorated with @triton.jit)
-            kernel_func = None
-            for name, obj in temp_module.__dict__.items():
-                if hasattr(obj, '__triton_kernel__') or (hasattr(obj, '__name__') and hasattr(obj, 'run')):
-                    kernel_func = obj
-                    break
-
-            if kernel_func is None:
-                return False, "No @triton.jit decorated function found"
-
-            # Try to get the kernel's signature for basic validation
-            # This will trigger Triton's parsing without full compilation
             try:
-                # Access the kernel object to trigger basic validation
-                _ = kernel_func.__name__
-                return True, "Success"
-            except Exception as e:
-                return False, f"Kernel validation failed: {str(e)}"
+                # Load module from file
+                spec = importlib.util.spec_from_file_location("temp_kernel", temp_file)
+                module = importlib.util.module_from_spec(spec)
+
+                # Add required imports to module namespace before execution
+                import builtins
+                module.__builtins__ = builtins
+                sys.modules['temp_kernel'] = module
+
+                spec.loader.exec_module(module)
+
+                # Find any function that looks like a kernel
+                kernel_func = None
+                for name in dir(module):
+                    if not name.startswith('_'):
+                        obj = getattr(module, name)
+                        if callable(obj) and hasattr(obj, '__name__'):
+                            # Check if it's defined in our module (not imported)
+                            if hasattr(obj, '__module__') and obj.__module__ == 'temp_kernel':
+                                kernel_func = obj
+                                break
+
+                if kernel_func is None:
+                    return False, "No kernel function found in module"
+
+                return True, f"Found kernel function: {kernel_func.__name__}"
+
+            finally:
+                # Clean up temp file and module
+                if 'temp_kernel' in sys.modules:
+                    del sys.modules['temp_kernel']
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
 
         except SyntaxError as e:
             return False, f"Syntax error: {str(e)}"
-        except ImportError as e:
-            return False, f"Import error: {str(e)}"
         except Exception as e:
-            return False, f"Compilation error: {str(e)}"
+            return False, f"Error: {str(e)}"
 
 
 

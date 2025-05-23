@@ -91,8 +91,8 @@ int main() {
     cuModuleGetFunction(&kernel, module, "_Z16gemm4x4_1d_tiledPfS_S_");
     
     // Get kernel launch configuration
-    int minGridSize, blockSize, maxGridSize;
-    cuOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, kernel, 0, 0);
+    int minGridSize, blockSize;
+    cuOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, kernel, 0, 0, 0);
     printf("Optimal block size: %d\n", blockSize);
     
     // Allocate host memory
