@@ -1,0 +1,114 @@
+###### ORIGINAL PROMPT #####
+
+Write a Triton kernel that computes the mean reduction along the last dimension of a 2D tensor with shape [M, N]
+
+#### KERNEL SPEC ####
+
+{
+  "input_shapes": [
+    [
+      256,
+      128
+    ]
+  ],
+  "output_shape": [
+    256
+  ],
+  "operation": "mean_reduction",
+  "optimization_level": "none"
+}
+
+#### GENERATION 1 RESPONSE ####
+
+<think>
+Okay, I need to write a Triton kernel that computes the mean along the last dimension of a 2D tensor with shape [M, N]. Let's break this down step by step.
+
+First, understanding the problem: The input is a 2D tensor with dimensions M (rows) and N (columns). The goal is to compute the mean along the last dimension, which means for each row (since the last dimension is N), we sum all elements in that row and then divide by N. So, each output element will be the average of a row.
+
+Next, considering the GPU operations. Since Triton is a GPU programming language, I'll need to use shared memory and proper memory access patterns. The kernel will process each row, sum its elements, and then divide by N. But how to structure the threads?
+
+I should think about how to partition the work. Each thread can handle a row. Since the rows are along the first dimension, each thread can process one row. But wait, if there are multiple threads per block, maybe each thread can process a column? Wait, no. Wait, the last dimension is N, so each row has N elements. So for each row, we need to sum N elements. So if I have a block of threads, each thread can handle a single element in the row. But that might not be efficient. Alternatively, maybe each thread can process a chunk of elements in the row. But for simplicity, perhaps each thread can process one element in the row. But that would require a lot of threads. Alternatively, maybe each thread can process a group of elements, but that depends on the block size.
+
+Wait, the standard approach for such reductions is to use a reduction. But since we're summing across the last dimension (columns), each row is a separate reduction. So for each row, we need to sum all N elements. So each row is a separate reduction. So perhaps each thread can handle a single element in the row, and then perform a reduction across the threads in the block.
+
+But how to structure this. Let me think. Let's say the kernel is designed to process each row. So for each row, we have N elements. Each thread in the block can handle a portion of the row. For example, if the block size is 128, then each thread can handle 128 elements. But if N is not a multiple of the block size, we need to handle that. But maybe the block size is chosen such that it's a divisor of N. Alternatively, we can use a dynamic approach where each thread handles a single element, and then perform a reduction across the threads in the block.
+
+Wait, but for a row with N elements, the total number of elements is N. So if we have a block of threads, each thread can take a single element from the row and accumulate the sum. Then, the block can perform a reduction to get the total sum for the row. Then, after all blocks have processed their rows, we divide by N to get the mean.
+
+So the steps would be:
+
+1. For each row (M rows), process all N elements in that row.
+2. For each row, sum the elements.
+3. Divide the sum by N to get the mean.
+
+Now, considering the memory layout. The input tensor is 2D, so each row is contiguous in memory. So for a given row i, the elements are at positions i*N, i*N+1, ..., i*N + N-1.
+
+In Triton, each thread can be assigned to a row. But how to handle the threads per block. Let's say we have a block size of 128. Then, each block processes one row. But if the row has N elements, and the block has 128 threads, each thread can process a single element in the row. Then, the block can perform a reduction to sum all elements in the row.
+
+But how to handle the threads per block. Let's think of each thread in the block as handling a single element in the row. So for a row, each thread in the block takes an element from the row, adds it to a shared memory sum, and then the block reduces the sum.
+
+But how to map the thread index to the element in the row. For example, if the row is i, then the elements are at positions i*N + j, where j ranges from 0 to N-1. So for a thread in the block, if the thread index is t, then the element is at i*N + t. But this requires that the block can process all elements in the row. So the block size must be <= N. If N is smaller than the block size, then some threads in the block will not have elements to process. So we need to handle that with masking.
+
+Alternatively, maybe the block size is set to the number of elements in the row. But that's not feasible since the row size
+
+#### GENERATION 1 SCORES ####
+compilation: 0.0
+correctness: 0.0
+optimization: 0.5
+total_reward: 0.5
+
+#### GENERATION 2 RESPONSE ####
+
+<think>
+Okay, I need to write a Triton kernel that computes the mean along the last dimension of a 2D tensor with shape [M, N]. Let me think through this step by step.
+
+First, the problem is to compute the mean of each row in a 2D tensor. Since the tensor is [M, N], each row has N elements, and we need to sum each row and then divide by N. So for each row i, the mean is sum(row_i) / N.
+
+Now, considering how Triton works, I need to figure out the grid and block sizes. Triton uses a dynamic grid and blocks. For a 2D tensor, each block can process a row. But since the last dimension is N, each block will handle one row. Wait, but maybe the blocks can process multiple elements in a row? Or maybe each block handles one row, and then the block processes all elements in that row.
+
+Wait, the kernel needs to process each row. So for each row i, the block will process all N elements in that row. But how to structure the blocks. Let me think: the number of rows is M, so the grid size would be M. Each block processes one row. But how to handle the elements in the row.
+
+Alternatively, maybe the blocks process multiple rows. But that might complicate things. Let me think again. The kernel needs to process each row. So the grid size is M, and each block processes one row. Then, within each block, we process all N elements of that row.
+
+But how to structure the block. For each row, the block will iterate over the columns (N elements). So for each row i, the block will compute the sum of the elements in that row.
+
+So, the kernel will have two dimensions: one for the row index, and one for the column index. But in Triton, the kernel is written with a grid and a block, and each thread processes a specific element.
+
+Wait, perhaps the kernel is structured such that each thread processes one element in a row. But that would require a lot of threads. Alternatively, maybe each block handles a row, and the threads within the block process the elements of that row.
+
+But how to handle the sum. Let me think: for each row i, the block will compute the sum of all elements in that row. Then, after all blocks have computed their sum, we can divide by N to get the mean.
+
+So the steps would be:
+
+1. For each row i in 0 to M-1:
+   a. Sum all elements in row i (from column 0 to N-1)
+   b. Divide the sum by N to get the mean for that row.
+
+So the kernel needs to process each row, and for each row, sum all elements.
+
+In Triton, the kernel is written with a grid of size M, and each block processes one row. Then, within the block, the threads process each element of the row.
+
+But how to structure the threads. Let's say each block has a certain number of threads. For example, if the block size is 128, then each block can process up to 128 elements in a row. But if the row has N elements, then the number of threads per block would be min(128, N). But that might complicate things.
+
+Alternatively, maybe each thread processes one element in the row. So for each row, the number of threads is N. But if N is large, that could be a lot of threads. However, Triton can handle that.
+
+But how to structure the kernel. Let's think of the kernel as follows:
+
+The kernel is called with the input tensor, and the output tensor. The output tensor has shape [M], since each row's mean is one value.
+
+Each thread in the kernel is responsible for processing one element in a row. Wait, but that's not efficient. Because for each row, we need to sum all elements. So perhaps the kernel is structured such that each block handles one row, and within the block, the threads process the elements of that row.
+
+But how to do that. Let me think about the parameters. The kernel will take the input tensor, which is [M, N]. The output tensor is [M].
+
+So, the kernel will have a grid of size M. Each block processes one row. Then, within the block, the threads process the elements of that row.
+
+But how to map the thread index to the row and column. Let's say that each block is responsible for row i. Then, the threads within the block process the columns of that row. So, for a block, the row index is i. Then, the thread index within the block is j, which corresponds to the column index in the row.
+
+But how to compute that. Let me think: the kernel is written with a grid of size M, and each block is assigned a row index. Then
+
+#### GENERATION 2 SCORES ####
+compilation: 0.0
+correctness: 0.0
+optimization: 0.5
+total_reward: 0.5
+

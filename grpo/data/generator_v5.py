@@ -318,7 +318,7 @@ if __name__ == "__main__":
     generator = TritonDataGenerator(provider)
 
     # Generate small test dataset
-    dataset = generator.generate_dataset(num_elementwise=3, num_reduction=3, num_matmul=3)
+    dataset = generator.generate_dataset(num_elementwise=100, num_reduction=100, num_matmul=100)
     generator.save_dataset(dataset, "triton_kernels_dataset_v5.json")
 
     # Print compilation stats

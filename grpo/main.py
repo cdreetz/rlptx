@@ -1,108 +1,119 @@
 """
-GRPO training loop for Triton kernel generation.
-
-Implements Group Relative Policy Optimization for training language models
-to generate better Triton kernels using the 3-part reward system.
+GRPO training for Triton kernel generation using Qwen3's thinking capabilities.
+Based on proven GRPO implementation for reasoning models.
 """
 
 import os
 import json
 import torch
 import argparse
-import random
-import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    GenerationConfig,
-    PreTrainedModel,
-    PreTrainedTokenizerBase
+    PreTrainedModel, 
+    PreTrainedTokenizerBase, 
+    GenerationConfig
 )
-import torch.nn.functional as F
 
 # Import our custom modules
-from evaluator import TritonKernelEvaluator
-from rldataset import get_dataloaders
+import rldataset
+import evaluator
+import utils
+import llms
 
 
-def seed_everything(seed: int) -> None:
-    """Set random seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def eval_on_test_set(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    test_loader: rldataset.TritonKernelLoader,
+    eval_class: evaluator.TritonKernelEvaluator,
+    device: str,
+    args: argparse.Namespace,
+    round_num: int
+) -> tuple[dict[str, float], float]:
+    """Evaluate model performance on test set."""
+    print("Running evaluation on test set...")
+    
+    # track metrics
+    total_scores = defaultdict(float)
+    num_examples = 0
+    total_accuracy = 0.0
 
+    log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
+    test_loader.reset()
+    
+    
+    with open(log_file, 'w') as f:
+        for prompt, spec in tqdm(test_loader, desc="Evaluating"):
+            # Generate completions
+            _, _, _, _, completions_text, _ = generate_completions(
+                model, tokenizer, prompt, device, args
+            )
+            
+            # Score completions
+            mock_prompts = [[{'content': prompt}]] * len(completions_text)
+            mock_completions = [[{'content': completion}] for completion in completions_text]
+            
+            rewards_per_func, metrics = eval_class.compute_rewards(
+                prompts=mock_prompts,
+                completions=mock_completions,
+                answer=spec,
+                device=device
+            )
 
-def get_llm_tokenizer(model_name: str, device: str) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
-    """Load and configure a language model and its tokenizer."""
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        device_map=None,
-    ).to(device)
+            total_accuracy += metrics['accuracy']
+            
+            for k, v in metrics.items():
+                total_scores[k] += v
+            num_examples += 1
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.use_cache = False
+            # Log example
+            f.write("\n" + "="*50 + "\n")
+            f.write(f"Example {num_examples}\n")
+            f.write(f"Prompt: {prompt}\n")
+            f.write(f"Spec: {json.dumps(spec, indent=2)}\n")
+            f.write(f"Response: {completions_text[0]}\n")
+            f.write("Metrics:\n")
+            for metric, value in metrics.items():
+                f.write(f"{metric}: {value}\n")
+            f.write(f"Total Score: {rewards_per_func.sum().item()}\n")
 
-    return model, tokenizer
+    # Calculate averages
+    avg_scores = {k: v/num_examples for k,v in total_scores.items()}
+    accuracy = total_accuracy / num_examples * 100
 
+    # Save metrics
+    metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
+    with open(metrics_path, 'w') as f:
+        json.dump({**avg_scores, 'accuracy': accuracy}, f, indent=4)
 
-def selective_log_softmax(logits, index):
-    """Memory-efficient log_softmax -> gather operation."""
-    if logits.dtype in [torch.float32, torch.float64]:
-        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
-        per_token_logps = selected_logits - logsumexp_values
-    else:
-        # More stable for bfloat16
-        per_token_logps = []
-        for row_logits, row_labels in zip(logits, index):
-            row_logps = F.log_softmax(row_logits, dim=-1)
-            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-            per_token_logps.append(row_per_token_logps)
-        per_token_logps = torch.stack(per_token_logps)
-    return per_token_logps
-
-
-def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
-    """Get per-token log probabilities from model."""
-    logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-    logits = logits[:, :-1, :]  # Exclude last logit
-    input_ids = input_ids[:, -logits_to_keep:]
-    logits = logits[:, -logits_to_keep:]
-    return selective_log_softmax(logits, input_ids)
+    return avg_scores, accuracy
 
 
 def generate_completions(
     model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: PreTrainedTokenizerBase, 
     prompt: str,
     device: str,
     args: argparse.Namespace
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str], str]:
     """Generate multiple completion sequences for a given prompt."""
 
-    # Format prompt with system message
-    chat_prompt = [
-        {'role': 'system', 'content': 'You are an expert at writing high-performance Triton kernels. Write clean, efficient code with proper imports, BLOCK_SIZE constants, masking, and @triton.jit decorator. Provide only kernel code without explanation.'},
+    # Format messages for Qwen3
+    messages = [
+        {'role': 'system', 'content': rldataset.SYSTEM_PROMPT},
         {'role': 'user', 'content': prompt}
     ]
-    prompt_text = tokenizer.apply_chat_template(chat_prompt, tokenize=False)
-
-    # Tokenize prompt
+    
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False)
     prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
     # Truncate prompt and repeat for multiple generations
     prompt_ids = prompt_ids[:, -args.max_prompt_length:]
     prompt_mask = prompt_mask[:, -args.max_prompt_length:]
+
+    # Repeat prompt for multiple generations
     prompt_ids = prompt_ids.repeat(args.num_chains, 1)
     prompt_mask = prompt_mask.repeat(args.num_chains, 1)
 
@@ -110,13 +121,14 @@ def generate_completions(
     prompt_ids = prompt_ids.to(device)
     prompt_mask = prompt_mask.to(device)
 
-    # Generation config
     generation_config = GenerationConfig(
         max_new_tokens=args.max_completion_length,
         do_sample=True,
-        temperature=args.temperature,
+        temperature=0.6,  # Qwen3 recommended for thinking
+        top_p=0.95,
         pad_token_id=tokenizer.pad_token_id
     )
+
 
     # Generate completions
     prompt_completion_ids = model.generate(
@@ -145,16 +157,37 @@ def generate_completions(
     return prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text
 
 
+def extract_thinking_and_kernel(completion_text: str) -> tuple[str, str]:
+    """Extract thinking portion and kernel portion from completion."""
+    thinking_part = ""
+    kernel_part = ""
+    
+    if '<think>' in completion_text and '</think>' in completion_text:
+        # Extract thinking content
+        think_start = completion_text.find('<think>') + len('<think>')
+        think_end = completion_text.find('</think>')
+        if think_end > think_start:
+            thinking_part = completion_text[think_start:think_end].strip()
+        
+        # Extract everything after </think> as kernel part
+        kernel_part = completion_text[think_end + len('</think>'):].strip()
+    else:
+        # No thinking tags, treat whole completion as kernel
+        kernel_part = completion_text
+    
+    return thinking_part, kernel_part
+
+
 def score_completions(
     completions_text: list[str],
     prompt: str,
     spec: dict,
-    evaluator: TritonKernelEvaluator,
+    eval_class: evaluator.TritonKernelEvaluator,
     device: str,
     args: argparse.Namespace
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], dict]:
     """Score model completions and compute advantages for training."""
-
+    
     # Build log data
     log_data = {
         'prompt': {
@@ -167,12 +200,12 @@ def score_completions(
     # Format for evaluator
     mock_prompts = [[{'content': prompt}]] * len(completions_text)
     mock_completions = [[{'content': completion}] for completion in completions_text]
-
+    
     # Get rewards from evaluator
-    rewards_per_func, metrics = evaluator.compute_rewards(
+    rewards_per_func, metrics = eval_class.compute_rewards(
         prompts=mock_prompts,
         completions=mock_completions,
-        answer=spec,  # spec contains input_shapes, output_shape, operation, optimization_level
+        answer=spec,
         device=device
     )
     rewards = rewards_per_func.sum(dim=1)
@@ -182,13 +215,40 @@ def score_completions(
         generation_data = {
             'response': completion,
             'scores': {
-                **evaluator.get_reward_breakdown(reward_scores),
+                **eval_class.get_reward_breakdown(reward_scores),
                 'total_reward': rewards[i].item()
             }
         }
         log_data['generations'].append(generation_data)
 
-    # Compute advantages using group statistics
+    # Debug output every 50 steps
+    if hasattr(args, '_debug_step_counter'):
+        args._debug_step_counter += 1
+    else:
+        args._debug_step_counter = 0
+        
+    if args._debug_step_counter % 50 == 0:
+        print(f"\n{'='*80}")
+        print(f"DEBUG Step {args._debug_step_counter}")
+        print(f"Prompt: {prompt}")
+        print(f"Rewards: {rewards.tolist()}")
+        
+        # Show thinking and kernel portions for first completion
+        thinking, kernel = extract_thinking_and_kernel(completions_text[0])
+        
+        if thinking:
+            print(f"\nThinking (first 100 chars):")
+            print(f"'{thinking[:100]}{'...' if len(thinking) > 100 else ''}'")
+        else:
+            print("\nNo thinking content found")
+            
+        print(f"\nKernel (first 100 chars):")
+        print(f"'{kernel[:100]}{'...' if len(kernel) > 100 else ''}'")
+        
+        print(f"\nMetrics: compilation_rate={metrics.get('compilation_rate', 0)*100:.1f}%")
+        print(f"{'='*80}")
+
+    # Compute advantages using group statistics (GRPO core)
     mean_grouped_rewards = rewards.view(-1, args.num_chains).mean(dim=1)
     std_grouped_rewards = rewards.view(-1, args.num_chains).std(dim=1)
 
@@ -210,7 +270,7 @@ def score_completions(
 
 def compute_loss(
     model: PreTrainedModel,
-    base_model: PreTrainedModel,
+    base_model: PreTrainedModel, 
     prompt_completion_ids: torch.Tensor,
     prompt_ids: torch.Tensor,
     completion_ids: torch.Tensor,
@@ -225,11 +285,11 @@ def compute_loss(
 
     # Get reference model logits
     with torch.inference_mode():
-        ref_per_token_logps = get_per_token_logps(base_model, prompt_completion_ids, attention_mask, logits_to_keep)
+        ref_per_token_logps = utils.get_per_token_logps(base_model, prompt_completion_ids, attention_mask, logits_to_keep)
 
     # Get training model logits
     input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-    per_token_logps = get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+    per_token_logps = utils.get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
 
     # Compute KL divergence
     per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
@@ -255,14 +315,14 @@ def grpo_loss(
     tokenizer: PreTrainedTokenizerBase,
     prompt: str,
     spec: dict,
-    evaluator: TritonKernelEvaluator,
+    eval_class: evaluator.TritonKernelEvaluator,
     device: str,
     round_num: int,
-    training_log_dir: str,
+    training_log_dir: str, 
     args: argparse.Namespace
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Compute GRPO loss for a single training step."""
-
+    """Compute GRPO loss for Triton kernel generation."""
+    
     # Generate completions
     prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text = generate_completions(
         model, tokenizer, prompt, device, args
@@ -270,12 +330,12 @@ def grpo_loss(
 
     # Score completions
     rewards, advantages, rewards_per_func, metrics, log_data = score_completions(
-        completions_text, prompt, spec, evaluator, device, args
+        completions_text, prompt, spec, eval_class, device, args
     )
 
-    # Write training log
+    # Write log data
     log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
-    write_generation_log(log_data, log_file)
+    utils.write_generation_log(log_data, log_file)
 
     # Compute loss
     completion_mask = attention_mask[:, prompt_ids.size(1):]
@@ -290,105 +350,30 @@ def grpo_loss(
     return loss, metrics
 
 
-def write_generation_log(log_data: dict, log_file: str) -> None:
-    """Write generation log to file."""
-    with open(log_file, 'w') as f:
-        f.write("###### ORIGINAL PROMPT #####\n\n")
-        f.write(log_data['prompt']['text'] + "\n\n")
-        f.write("#### KERNEL SPEC ####\n\n")
-        f.write(json.dumps(log_data['prompt']['spec'], indent=2) + "\n\n")
-
-        for i, gen in enumerate(log_data['generations'], 1):
-            f.write(f"#### GENERATION {i} RESPONSE ####\n\n")
-            f.write(gen['response'] + "\n\n")
-            f.write(f"#### GENERATION {i} SCORES ####\n")
-
-            f.write(f"Compilation: {gen['scores']['compilation']}\n")
-            f.write(f"Correctness: {gen['scores']['correctness']}\n")
-            f.write(f"Optimization: {gen['scores']['optimization']}\n")
-            f.write(f"Total reward: {gen['scores']['total_reward']}\n\n")
-
-
-def eval_on_test_set(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizerBase,
-    test_loader,
-    evaluator: TritonKernelEvaluator,
-    device: str,
-    args: argparse.Namespace,
-    round_num: int
-) -> tuple[dict[str, float], float]:
-    """Evaluate model on test set."""
-
-    print("Running evaluation on test set...")
-
-    total_scores = defaultdict(float)
-    num_examples = 0
-
-    log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
-    test_loader.reset()
-
-    with open(log_file, 'w') as f:
-        for prompt, spec in tqdm(test_loader, desc="Evaluating"):
-            # Generate completions
-            _, _, _, _, completions_text, _ = generate_completions(
-                model, tokenizer, prompt, device, args
-            )
-
-            # Score completions
-            mock_prompts = [[{'content': prompt}]] * len(completions_text)
-            mock_completions = [[{'content': completion}] for completion in completions_text]
-
-            rewards_per_func, metrics = evaluator.compute_rewards(
-                prompts=mock_prompts,
-                completions=mock_completions,
-                answer=spec,
-                device=device
-            )
-
-            for k, v in metrics.items():
-                total_scores[k] += v
-            num_examples += 1
-
-            # Log example
-            f.write("\n" + "="*50 + "\n")
-            f.write(f"Example {num_examples}\n")
-            f.write(f"Prompt: {prompt}\n")
-            f.write(f"Spec: {json.dumps(spec, indent=2)}\n")
-            f.write(f"Response: {completions_text[0]}\n")
-            f.write("Metrics:\n")
-            for metric, value in metrics.items():
-                f.write(f"{metric}: {value}\n")
-
-    # Calculate averages
-    avg_scores = {k: v/num_examples for k,v in total_scores.items()}
-
-    # Use compilation rate as primary accuracy metric
-    accuracy = avg_scores.get('compilation_rate', 0.0) * 100
-
-    # Save metrics
-    metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
-    with open(metrics_path, 'w') as f:
-        json.dump({**avg_scores, 'accuracy': accuracy}, f, indent=4)
-
-    return avg_scores, accuracy
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training for Triton kernels")
-
+    
     # Model and dataset
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B", help="Model to train")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-4B", help="Model to train")
     parser.add_argument("--dataset_path", type=str, default="data/triton_kernels_dataset_v5.json", help="Path to kernel dataset")
+
+    # Output and logging
+    parser.add_argument("--output_dir", type=str, default="triton_grpo_output", help="Output directory")
+    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument("--save_steps", type=int, default=200, help="Save model every N steps")
+    parser.add_argument("--eval_iterations", type=int, default=100, help="Evaluation frequency")
 
     # Training hyperparameters
     parser.add_argument("--learning_rate", type=float, default=5e-6, help="Learning rate")
-    parser.add_argument("--num_train_iters", type=int, default=1000, help="Training iterations")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation")
-    parser.add_argument("--max_grad_norm", type=float, default=0.1, help="Gradient clipping")
-    parser.add_argument("--warmup_percent", type=float, default=0.18, help="Warmup percentage")
+    parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
+    parser.add_argument("--adam_beta2", type=float, default=0.99, help="Adam beta2") 
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("--kl_weight_beta", type=float, default=0.04, help="KL penalty weight")
+    parser.add_argument("--max_grad_norm", type=float, default=0.1, help="Gradient clipping")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation")
+    parser.add_argument("--warmup_percent", type=float, default=0.18, help="Warmup percentage")
+    parser.add_argument("--update_ref_model", action="store_true", help="Update reference model")
+    parser.add_argument("--update_ref_model_freq", type=int, default=200, help="Reference model update frequency")
+    parser.add_argument("--ref_model_mixup_alpha", type=float, default=0.1, help="Reference model mixup alpha")
 
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature")
@@ -396,78 +381,92 @@ def parse_args():
     parser.add_argument("--max_prompt_length", type=int, default=512, help="Max prompt length")
     parser.add_argument("--max_completion_length", type=int, default=1024, help="Max completion length")
 
-    # Reference model updates
-    parser.add_argument("--update_ref_model", action="store_true", help="Update reference model")
-    parser.add_argument("--update_ref_model_freq", type=int, default=200, help="Reference model update frequency")
-    parser.add_argument("--ref_model_mixup_alpha", type=float, default=0.1, help="Reference model mixup alpha")
-
-    # Logging and evaluation
-    parser.add_argument("--output_dir", type=str, default="triton_grpo_output", help="Output directory")
-    parser.add_argument("--eval_iterations", type=int, default=50, help="Evaluation frequency")
-    parser.add_argument("--save_steps", type=int, default=200, help="Model save frequency")
-    parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    # Training parameters
+    parser.add_argument("--num_train_iters", type=int, default=1000, help="Training iterations")
+    parser.add_argument("--kl_weight_beta", type=float, default=0.04, help="KL penalty weight")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     return parser.parse_args()
 
 
 def main():
+    # Get args and setup
     args = parse_args()
-
-    # Setup
-    seed_everything(args.seed)
+    utils.seed_everything(args.seed)
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
     torch.set_float32_matmul_precision('high')
 
     # Load model and tokenizer
     print("Loading model and tokenizer...")
-    model, tokenizer = get_llm_tokenizer(args.model_name, device)
-    base_model, _ = get_llm_tokenizer(args.model_name, device)
+    model, tokenizer = llms.get_llm_tokenizer(args.model_name, device)
+    base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
 
     # Load dataset
     print("Loading dataset...")
-    train_loader, test_loader = get_dataloaders(args.dataset_path)
+    train_loader, test_loader = rldataset.get_dataloaders(args.dataset_path)
     print(f"Train examples: {len(train_loader)}, Test examples: {len(test_loader)}")
 
     # Setup evaluator
-    evaluator = TritonKernelEvaluator()
+    eval_class = evaluator.TritonKernelEvaluator()
 
-    # Setup directories
+    # Setup logging directories
     os.makedirs(args.output_dir, exist_ok=True)
+    args_dict = vars(args)
+    args_path = os.path.join(args.output_dir, 'args.json')
+    with open(args_path, 'w') as f:
+        json.dump(args_dict, f, indent=4)
+    
+    eval_log_dir = os.path.join(args.output_dir, 'eval_logs')
+    os.makedirs(eval_log_dir, exist_ok=True)
     train_log_dir = os.path.join(args.output_dir, 'training_logs')
     os.makedirs(train_log_dir, exist_ok=True)
 
-    # Save config
-    with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
-        json.dump(vars(args), f, indent=2)
-
-    # Setup optimizer and scheduler
+    # Setup optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
-        weight_decay=args.weight_decay
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
+        eps=1e-8
     )
 
+    # Add linear warmup learning rate scheduler
     warmup_steps = int(args.warmup_percent * args.num_train_iters)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lambda step: (step / warmup_steps) if step < warmup_steps else 1.0
-    )
+    def get_lr(step):
+        if step < warmup_steps:
+            return (step / warmup_steps)
+        return 1.0
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr)
 
     # Training loop
-    print("Starting training...")
+    print("Starting GRPO training...")
     optimizer.zero_grad()
     train_metrics_total = {}
-
+    
     for round_num in tqdm(range(args.num_train_iters), desc="Training"):
-
-        # Evaluation
+        
+        # Evaluate on test set
         if round_num % args.eval_iterations == 0:
             eval_metrics, eval_accuracy = eval_on_test_set(
-                model, tokenizer, test_loader, evaluator, device, args, round_num
+                model=model,
+                tokenizer=tokenizer, 
+                test_loader=test_loader,
+                eval_class=eval_class,
+                device=device,
+                args=args,
+                round_num=round_num
             )
-            print(f"Eval at step {round_num}: Compilation rate = {eval_accuracy:.1f}%")
+            print(f"\nEval at step {round_num}: Compilation rate = {eval_accuracy:.1f}%")
+            
+            # Save metrics
+            metrics_path = os.path.join(eval_log_dir, f'metrics_{round_num}.json')
+            with open(metrics_path, 'w') as f:
+                json.dump({
+                    'metrics': eval_metrics,
+                    'accuracy': eval_accuracy
+                }, f, indent=4)
 
         # Update reference model
         if args.update_ref_model and (round_num + 1) % args.update_ref_model_freq == 0:
@@ -478,14 +477,14 @@ def main():
         # Get training example
         prompt, spec = next(train_loader)
 
-        # GRPO training step
-        loss, train_metrics = grpo_loss(
-            model, base_model, tokenizer, prompt, spec, evaluator,
+        # GRPO loss computation
+        total_loss, train_metrics = grpo_loss(
+            model, base_model, tokenizer, prompt, spec, eval_class, 
             device, round_num, train_log_dir, args
         )
-
-        # Backprop
-        loss.backward()
+        
+        # Backpropagation
+        total_loss.backward()
         scheduler.step()
 
         # Optimizer step with gradient accumulation
@@ -496,10 +495,11 @@ def main():
 
         # Logging
         train_metrics["learning_rate"] = scheduler.get_last_lr()[0]
-        train_metrics["loss"] = loss.item()
+        train_metrics["loss"] = total_loss.item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
+        train_metrics["grad_norm"] = grad_norm
         train_metrics_total[round_num] = train_metrics
-
-        # Save training logs
+        
         with open(os.path.join(train_log_dir, "train_logs.json"), "w") as f:
             json.dump(train_metrics_total, f, indent=4)
 

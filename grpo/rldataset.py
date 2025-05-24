@@ -36,15 +36,15 @@ class DataLoader(ABC):
         pass
 
 
-SYSTEM_PROMPT = """You are an expert at writing high-performance Triton kernels.
-
-Write clean, efficient Triton code that:
-- Includes proper imports (triton, triton.language as tl)
-- Uses appropriate BLOCK_SIZE constants
-- Handles edge cases with proper masking
-- Includes the @triton.jit decorator
-
-Provide only the kernel code without explanation."""
+SYSTEM_PROMPT = """
+Respond in the following format:
+<reasoning>
+...
+</reasoning>
+<code>
+...
+</code>
+"""
 
 
 class TritonKernelLoader(DataLoader):
@@ -61,10 +61,25 @@ class TritonKernelLoader(DataLoader):
         current_index (int): Current position for sequential access
     """
 
-    def __init__(self, prompts: List[str], specs: List[Dict[str, Any]], random: bool = False) -> None:
+    def __init__(self, prompts: List[str], specs: List[Dict[str, Any]], random: bool = False, answers: List[str] = None) -> None:
         super().__init__(random)
         self.prompts = prompts
         self.specs = specs
+        self.answers = answers
+        self.pre_prompt = """You will be given a task that involves reasoning. You should reason carefully about the question, then provide the answer.
+            It is very important that you put your reasoning process inside <think> tags and your final answer inside <code> tags, like this:
+
+            <think>
+            Your step-by-step reasoning process
+            </think>
+            <code>
+            Your final answer
+            </code>
+
+            All of your returned text should either be in the <think> or <code> tags - no text outside! Start each answer by immediately starting with <reasoning>.
+            It is extremely important that you answer in this way - do not put any information or text outside of these tags!
+
+            Question: """
         self.system_prompt = SYSTEM_PROMPT
 
     def __len__(self) -> int:
@@ -83,7 +98,7 @@ class TritonKernelLoader(DataLoader):
             idx = self.current_index
             self.current_index += 1
 
-        return self.prompts[idx], self.specs[idx]
+        return self.prompts[idx], self.specs[idx], self.answers[idx]
 
     def reset(self):
         """Reset iterator to beginning."""
@@ -108,27 +123,25 @@ def load_kernel_dataset(dataset_path: str) -> Tuple[List[str], List[Dict[str, An
     specs = []
 
     for item in data:
-        # Extract just the task description from the full prompt
-        # The full prompt contains system instructions, we just want the task
         full_prompt = item['prompt']
 
-        # Find the task description (starts after "Task: ")
-        if "Task: " in full_prompt:
-            task_start = full_prompt.find("Task: ") + len("Task: ")
-            task_end = full_prompt.find("\n\nRequirements:")
-            if task_end == -1:
-                task_end = full_prompt.find("\nRequirements:")
+        ## Find the task description (starts after "Task: ")
+        #if "Task: " in full_prompt:
+        #    task_start = full_prompt.find("Task: ") + len("Task: ")
+        #    task_end = full_prompt.find("\n\nRequirements:")
+        #    if task_end == -1:
+        #        task_end = full_prompt.find("\nRequirements:")
 
-            if task_end != -1:
-                task_prompt = full_prompt[task_start:task_end].strip()
-            else:
-                # Fallback: use everything after "Task: "
-                task_prompt = full_prompt[task_start:].strip()
-        else:
-            # Fallback: use the full prompt
-            task_prompt = full_prompt
+        #    if task_end != -1:
+        #        task_prompt = full_prompt[task_start:task_end].strip()
+        #    else:
+        #        # Fallback: use everything after "Task: "
+        #        task_prompt = full_prompt[task_start:].strip()
+        #else:
+        #    # Fallback: use the full prompt
+        #    task_prompt = full_prompt
 
-        prompts.append(task_prompt)
+        prompts.append(full_prompt)
 
         # Create spec dictionary with all needed info for evaluation
         spec = {
@@ -186,7 +199,7 @@ def build_triton_dataloaders(dataset_path: str, test_split: float = 0.1) -> Tupl
 
     # Setup data loaders
     # Training loader uses random=True for variety during training
-    train_loader = TritonKernelLoader(train_prompts.tolist(), test_specs.tolist(), random=True)
+    train_loader = TritonKernelLoader(train_prompts.tolist(), train_specs.tolist(), random=True)
     test_loader = TritonKernelLoader(test_prompts.tolist(), test_specs.tolist(), random=False)
 
     return train_loader, test_loader
