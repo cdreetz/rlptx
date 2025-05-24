@@ -61,7 +61,7 @@ def eval_on_test_set(
                 device=device
             )
 
-            total_accuracy += metrics['accuracy']
+            total_accuracy += metrics['compilation_rate']
             
             for k, v in metrics.items():
                 total_scores[k] += v

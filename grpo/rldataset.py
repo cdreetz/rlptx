@@ -38,9 +38,9 @@ class DataLoader(ABC):
 
 SYSTEM_PROMPT = """
 Respond in the following format:
-<reasoning>
+<think>
 ...
-</reasoning>
+</think>
 <code>
 ...
 </code>
@@ -98,7 +98,7 @@ class TritonKernelLoader(DataLoader):
             idx = self.current_index
             self.current_index += 1
 
-        return self.prompts[idx], self.specs[idx], self.answers[idx]
+        return self.prompts[idx], self.specs[idx]
 
     def reset(self):
         """Reset iterator to beginning."""
