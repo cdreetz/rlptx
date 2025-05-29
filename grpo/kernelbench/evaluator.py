@@ -82,9 +82,9 @@ def get_evaluator(name: str) -> RewardEvaluator:
         raise NotImplementedError(f"No evaluator implemented for {name}")
 
 def extract_kernel_methods(text: str) -> tuple[str, str]:
-    if "triton_kernel" in text and "tritton_wrapper" in text:
+    if "triton_kernel" in text and "triton_wrapper" in text:
         kernel_start = text.find("triton_kernel") 
-        wrapper_start = text.find("tritton_wrapper")
+        wrapper_start = text.find("triton_wrapper")
         
         wrapper_lines = text[wrapper_start:].split('\n')
         wrapper_end = wrapper_start
@@ -106,13 +106,20 @@ class KernelBenchEvaluator(RewardEvaluator):
     Reward evaluator for the KernelBench dataset.
     
     Implements reward functions for:
+    - Method names (small reward for including required method names)
     - Compiles
     - Correctness
     - Performance
     """
     
     def __init__(self):
-        self.num_reward_functions = 3
+        self.num_reward_functions = 4
+
+    def _format_reward(self, prompts, completions, answer) -> List[float]:
+        """Small reward for including the required method names."""
+        responses = [completion[0]['content'] for completion in completions]
+        extracted = [extract_kernel_methods(r) for r in responses]
+        return [0.25 * (bool(kernel_code) + bool(wrapper_code)) for kernel_code, wrapper_code in extracted]
     
     def _compiles_reward(self, prompts, completions, answer) -> List[float]:
         """Reward for compiling."""
@@ -152,6 +159,7 @@ class KernelBenchEvaluator(RewardEvaluator):
             self._compiles_reward(prompts, completions, answer),
             self._correctness_reward(prompts, completions, answer),
             self._perf_reward(prompts, completions, answer),
+            self._format_reward(prompts, completions, answer),
         ]
         
         # Fill rewards tensor
@@ -162,16 +170,17 @@ class KernelBenchEvaluator(RewardEvaluator):
         reward_per_func = rewards_per_func.mean(0)
         
         # Calculate accuracy (perfect correctness score)
-        compiles_scores = rewards_per_func[:, 0]
-        correctness_scores = rewards_per_func[:, 1]
-        perf_scores = rewards_per_func[:, 2]
+        compiles_scores = rewards_per_func[:, 1]  # Updated index since method names is now first
+        correctness_scores = rewards_per_func[:, 2]
+        perf_scores = rewards_per_func[:, 3]
         num_compiles = (compiles_scores == 2.0).sum().item()
         accuracy = num_compiles / num_completions
         
         metrics = {
-            "rewards/compiles_reward_func": reward_per_func[0].item(),
-            "rewards/correctness_reward_func": reward_per_func[1].item(),
-            "rewards/perf_reward_func": reward_per_func[2].item(),
+            "rewards/method_names_reward_func": reward_per_func[0].item(),
+            "rewards/compiles_reward_func": reward_per_func[1].item(),
+            "rewards/correctness_reward_func": reward_per_func[2].item(),
+            "rewards/perf_reward_func": reward_per_func[3].item(),
             "reward": rewards_per_func.sum(dim=1).mean().item(),
             "accuracy": accuracy
         }
@@ -184,4 +193,5 @@ class KernelBenchEvaluator(RewardEvaluator):
             'compiles': reward_scores[0].item(),
             'correctness': reward_scores[1].item(),
             'performance': reward_scores[2].item(),
+            'method_names': reward_scores[3].item(),
         }
