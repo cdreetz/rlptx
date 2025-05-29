@@ -59,32 +59,38 @@ class KernelBenchLoader(DataLoader):
 Your output should include a method named 'triton_kernel' that implements the kernel
 and a 'triton_wrapper' method that runs the kernel.
 It is important that you name the methods exactly as specified.
-You don't need to provide any explanatory text, just the code methods listed above.
+
+REQUIREMENTS:
+- Use @triton.jit decorator (no parameters)
+- Use tl.load() and tl.store() for memory operations
+- Include proper grid calculation in wrapper
+- Use masking for memory safety
+- Launch kernel with: kernel[grid](args) syntax
 
 The torch code is provided below:
 
 Torch Code: """
 
         self.post_prompt = """
+Write the triton implementation with these components:
 
-Write the above torch code with triton, like:
+1. Import statements: torch, triton, triton.language as tl
+2. @triton.jit decorated kernel function named 'triton_kernel'
+3. Wrapper function named 'triton_wrapper' that:
+   - Creates output tensors
+   - Calculates grid size using triton.cdiv()
+   - Launches kernel with proper syntax
 
-import triton
-import triton.language as tl
+Key patterns to use:
+- pid = tl.program_id(axis=0) for thread block ID
+- offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) for indexing
+- mask = offsets < n_elements for bounds checking
+- tl.load(ptr + offsets, mask=mask) and tl.store(ptr + offsets, data, mask=mask)
 
-@triton.jit
-def triton_kernel(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    BLOCK_SIZE: tl.constexpr
-):
-    tl.store(c_ptr)
-
-def triton_wrapper(a, b):
-    triton_kernel(a, b, c, BLOCK_SIZE=1024)
-    return c
-    """
+Avoid these common mistakes:
+- Do NOT use numpy operations in kernel
+- Do NOT use invalid decorator parameters
+- Do NOT use incorrect kernel launch syntax"""
 
     def __len__(self) -> int:
         return len(self.prompts)
