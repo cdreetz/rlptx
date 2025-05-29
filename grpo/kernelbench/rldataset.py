@@ -54,32 +54,16 @@ class KernelBenchLoader(DataLoader):
         super().__init__(random)
         self.prompts = prompts
         self.answers = answers
-        self.pre_prompt = """You are a helpful assistant tasked with writing PyTorch code as Triton kernels.
+        self.pre_prompt = """Read the following pytorch model and implement it as a python triton kernel.
 
-            Name the kernel method as "triton_kernel" and the wrapper as "tritton_wrapper".
+Your output should include a method named 'triton_kernel' that implements the kernel
+and a 'triton_wrapper' method that runs the kernel.
+It is important that you name the methods exactly as specified.
+You don't need to provide any explanatory text, just the code methods listed above.
 
-            Example:
-            ```python
-            import triton
-            import triton.language as tl
+The torch code is provided below:
 
-            @triton.jit
-            def triton_kernel(
-                a_ptr, b_ptr, c_ptr, 
-                stride_am, stride_ak, stride_bn, 
-                stride_bk, stride_cm, stride_cn, 
-                BLOCK_SIZE_M: tl.constexpr,  BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr
-                ...
-
-            def triton_wrapper(A, B):
-                ...
-                return C
-            ```
-
-            Your output should include a 'triton_kernel' and a 'triton_wrapper' method.
-            You don't need to explain anything just write the kernel and wrapper.
-
-            Torch Code: """
+Torch Code: """
 
     def __len__(self) -> int:
         return len(self.prompts)

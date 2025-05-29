@@ -134,7 +134,7 @@ def generate_completions(
         prompt_text: The full formatted prompt text
     """
     # 1. Prepare prompting
-    system_prompt = "You are a helpful assistant tasked with writing PyTorch code as Triton kernels."
+    system_prompt = "You are a helpful assistant that is an expert in PyTorch and Python Triton kernels."
     prompt = [
         {'role': 'system', 'content': system_prompt},
         {'role': 'user', 'content': question}
