@@ -55,42 +55,61 @@ class KernelBenchLoader(DataLoader):
         self.prompts = prompts
         self.answers = answers
         self.pre_prompt = """Read the following pytorch model and implement it as a python triton kernel.
-
 Your output should include a method named 'triton_kernel' that implements the kernel
 and a 'triton_wrapper' method that runs the kernel.
-It is important that you name the methods exactly as specified.
 
-REQUIREMENTS:
-- Use @triton.jit decorator (no parameters)
-- Use tl.load() and tl.store() for memory operations
-- Include proper grid calculation in wrapper
-- Use masking for memory safety
-- Launch kernel with: kernel[grid](args) syntax
+Here is an example of a simple element-wise multiplication kernel:
 
-The torch code is provided below:
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def triton_kernel(
+    a_ptr,
+    b_ptr, 
+    output_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    
+    a = tl.load(a_ptr + offsets, mask=mask)
+    b = tl.load(b_ptr + offsets, mask=mask)
+    output = a * b
+    
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+def triton_wrapper(a, b):
+    output = torch.empty_like(a)
+    n_elements = output.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+    
+    triton_kernel[grid](a, b, output, n_elements, BLOCK_SIZE)
+    return output
+```
+
+Now implement the torch code below using the same pattern:
 
 Torch Code: """
 
         self.post_prompt = """
-Write the triton implementation with these components:
 
-1. Import statements: torch, triton, triton.language as tl
-2. @triton.jit decorated kernel function named 'triton_kernel'
-3. Wrapper function named 'triton_wrapper' that:
-   - Creates output tensors
-   - Calculates grid size using triton.cdiv()
-   - Launches kernel with proper syntax
+Follow the exact same structure as the example above:
+1. @triton.jit decorator on kernel function
+2. Proper pointer parameters and n_elements
+3. Use tl.program_id(axis=0) and tl.arange() for indexing
+4. Include mask = offsets < n_elements for safety
+5. Use tl.load() and tl.store() with mask parameter
+6. Wrapper creates output tensor and calculates grid with triton.cdiv()
+7. Launch with triton_kernel[grid](...) syntax
 
-Key patterns to use:
-- pid = tl.program_id(axis=0) for thread block ID
-- offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE) for indexing
-- mask = offsets < n_elements for bounds checking
-- tl.load(ptr + offsets, mask=mask) and tl.store(ptr + offsets, data, mask=mask)
-
-Avoid these common mistakes:
-- Do NOT use numpy operations in kernel
-- Do NOT use invalid decorator parameters
-- Do NOT use incorrect kernel launch syntax"""
+Adapt the computation logic to match the torch operation, but keep the same structure."""
 
     def __len__(self) -> int:
         return len(self.prompts)
