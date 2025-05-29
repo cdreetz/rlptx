@@ -2,7 +2,9 @@
 """
 SFT trainer to finetune Qwen 1.5B on Triton kernel dataset
 """
-
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TRANSFORMERS_NO_TF'] = '1'
 import json
 import torch
 from torch.utils.data import Dataset
@@ -65,12 +67,12 @@ PyTorch code:
             formatted_text,
             truncation=True,
             max_length=self.max_length,
-            padding=False,
-            return_tensors="pt"
+            padding="max_length",
+            return_tensors=None
         )
         
-        input_ids = tokenized['input_ids'].squeeze()
-        attention_mask = tokenized['attention_mask'].squeeze()
+        input_ids = tokenized['input_ids']
+        attention_mask = tokenized['attention_mask']
         
         # For instruction tuning, we typically mask the instruction part
         # and only compute loss on the response part
@@ -83,16 +85,17 @@ PyTorch code:
             instruction_tokens = self.tokenizer(
                 instruction_part, 
                 add_special_tokens=False,
-                return_tensors="pt"
-            )['input_ids'].squeeze()
+                return_tensors=None
+            )['input_ids']
             
             # Create labels: -100 for instruction tokens, actual tokens for response
-            labels = input_ids.clone()
-            if len(instruction_tokens.shape) > 0:
-                labels[:len(instruction_tokens)] = -100
+            labels = input_ids.copy()
+            if len(instruction_tokens) > 0:
+                for i in range(min(len(instruction_tokens), len(labels))):
+                    labels[i] = -100
         else:
             # Fallback: use all tokens for loss
-            labels = input_ids.clone()
+            labels = input_ids.copy()
         
         return {
             'input_ids': input_ids,
