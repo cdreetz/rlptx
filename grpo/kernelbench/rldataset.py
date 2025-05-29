@@ -65,6 +65,27 @@ The torch code is provided below:
 
 Torch Code: """
 
+        self.post_prompt = """
+
+Write the above torch code with triton, like:
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def triton_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    BLOCK_SIZE: tl.constexpr
+):
+    tl.store(c_ptr)
+
+def triton_wrapper(a, b):
+    triton_kernel(a, b, c, BLOCK_SIZE=1024)
+    return c
+    """
+
     def __len__(self) -> int:
         return len(self.prompts)
 
@@ -82,7 +103,7 @@ Torch Code: """
             self.current_index += 1
 
         # Format the question with the pre-prompt and the actual torch code
-        formatted_question = self.pre_prompt + self.prompts[idx]
+        formatted_question = self.pre_prompt + self.prompts[idx] + self.post_prompt
         
         return formatted_question, self.answers[idx]
 
