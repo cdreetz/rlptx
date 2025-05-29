@@ -54,7 +54,6 @@ class KernelBenchLoader(DataLoader):
         super().__init__(random)
         self.prompts = prompts
         self.answers = answers
-        self.system_prompt = "You are a helpful assistant tasked with writing PyTorch code as Triton kernels."
         self.pre_prompt = """You are a helpful assistant tasked with writing PyTorch code as Triton kernels.
 
             Name the kernel method as "triton_kernel" and the wrapper as "tritton_wrapper".
@@ -77,8 +76,10 @@ class KernelBenchLoader(DataLoader):
                 return C
             ```
 
+            Your output should include a 'triton_kernel' and a 'triton_wrapper' method.
+            You don't need to explain anything just write the kernel and wrapper.
 
-            Question: """
+            Torch Code: """
 
     def __len__(self) -> int:
         return len(self.prompts)
@@ -96,7 +97,10 @@ class KernelBenchLoader(DataLoader):
             idx = self.current_index
             self.current_index += 1
 
-        return self.prompts[idx], self.answers[idx]
+        # Format the question with the pre-prompt and the actual torch code
+        formatted_question = self.pre_prompt + self.prompts[idx]
+        
+        return formatted_question, self.answers[idx]
 
     def reset(self):
         """Reset iterator to beginning."""
