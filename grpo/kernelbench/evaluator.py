@@ -7,7 +7,7 @@ import re
 import torch
 from abc import ABC, abstractmethod
 from typing import List, Dict, Tuple, Any
-from .evaluate_template import evaluate
+from evaluate_template import evaluate
 
 class RewardEvaluator(ABC):
     """

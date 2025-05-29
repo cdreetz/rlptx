@@ -107,7 +107,7 @@ class KernelBenchLoader(DataLoader):
         self.current_index = 0
 
 def build_kernelbench_dataloaders(test_split: float = 0.1, level_filter: int = None) -> Tuple[KernelBenchLoader, KernelBenchLoader]:
-    data = load_dataset('ScalingIntelligence/KernelBench', 'main')["train"]
+    data = load_dataset('ScalingIntelligence/KernelBench', 'default')["level_1"]
 
     questions = []
     answers = []
