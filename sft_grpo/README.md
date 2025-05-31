@@ -14,3 +14,8 @@
 
 - modal sandbox 
 - after generating, parse the xml for kernel and launch method, parse launch method for expected arguements, execute in sandbox for pass/fail
+
+
+### Examples
+
+- test_kernel_2.py and test_kernel_3.py are real examples of generated code and the structure i have landed on for the easiest to generate and validate kernels 
