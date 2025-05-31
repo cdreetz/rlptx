@@ -1,6 +1,6 @@
 # SFT Warmup + GRPO
 
-- utilizing '<kernel></kernel>' '<launch_fn></launch_fn>' tags for ez extract and test
+- utilizing \<kernel> <launch_fn> tags for ez extract and test
 - dynamic run() method that attempts to parse launch arguements and randomly create tensor/vector sizes
 
 ### SFT Data
