@@ -21,6 +21,7 @@ class SFTDatasetGenerator:
         self.xml_format = xml_format
         self.post_prompt = """
         Write both the kernel method and the corresponding launch method. 
+        Include the docstring explaining arguments and expected size, shape, and number of dimensions.
         Answer in the following format:\n
         """
         random.seed(seed)
@@ -28,7 +29,9 @@ class SFTDatasetGenerator:
         You are playing the role of user who is going to ask for a triton kernel for a given pytorch operation. Given an operation, respond with a query a user would ask for a triton kernel for that operation.
         """
         self.responses_system_prompt = """
-        You are playing the role of a triton kernel expert. Given a query, respond with a triton kernel for the given operation.
+        You are playing the role of a triton kernel expert. 
+        Given a query, respond with a triton kernel for the given operation. 
+        It is important that kernel and launch functions are correctly wrapped in their tags.
         """
 
     def create_synthetic_queries(self, k):
