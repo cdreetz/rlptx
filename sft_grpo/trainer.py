@@ -4,7 +4,7 @@ import torch
 from datetime import datetime
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_cosine_schedule_with_warmup
 import os
 from tqdm import tqdm
 from datasets import load_dataset
@@ -49,6 +49,7 @@ class SFTTrainingSetup:
         self.tokenizer = None
         self.model = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.global_step = 0
         
     def load_model_and_tokenizer(self):
         print(f"Loading {self.model_name}...")
@@ -129,16 +130,18 @@ class SFTTrainingSetup:
 
         print(f"Logging to {self.log_dir}")
 
-    def log_metrics(self, epoch, step, train_loss, eval_loss=None, lr=None):
+    def log_metrics(self, epoch, step, global_step, train_loss, eval_loss=None, lr=None, grad_norm=None):
         timestamp = datetime.now().isoformat()
 
         log_entry = {
             "timestamp": timestamp,
             "epoch": epoch,
             "step": step,
+            "global_step": global_step,
             "train_loss": train_loss,
             "eval_loss": eval_loss,
-            "learning_rate": lr
+            "learning_rate": lr,
+            "grad_norm": grad_norm
         }
 
         with open(self.train_log_file, 'a') as f:
@@ -146,10 +149,10 @@ class SFTTrainingSetup:
 
         with open(self.metrics_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp, epoch, step, train_loss, eval_loss, lr])
+            writer.writerow([timestamp, epoch, step, global_step, train_loss, eval_loss, lr, grad_norm])
 
 
-    def train_epoch(self, model, dataloader, optimizer, epoch, gradient_accumulation_steps=4):
+    def train_epoch(self, model, dataloader, optimizer, scheduler, epoch, eval_dataloader, eval_steps, gradient_accumulation_steps=2):
         """Train for one epoch"""
         model.train()
         total_loss = 0
@@ -167,33 +170,45 @@ class SFTTrainingSetup:
             accumulated_loss += loss.item()
 
             if (batch_idx + 1) % gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
 
+                self.global_step += 1
                 total_loss += accumulated_loss
                 current_lr = optimizer.param_groups[0]['lr']
 
                 actual_step = (batch_idx + 1) // gradient_accumulation_steps
-                global_step = (epoch - 1) * (len(dataloader) // gradient_accumulation_steps) + actual_step
-
 
                 wandb.log({
                     "train/loss": accumulated_loss,
                     "train/learning_rate": current_lr,
+                    "train/grad_norm": grad_norm.item(),
                     "train/epoch": epoch,
-                    "train/step": actual_step
-                }, step=global_step)
+                    "train/step": actual_step,
+                    "train/global_step": self.global_step
+                }, step=self.global_step)
                 
                 pbar.set_postfix({
-                    'loss': f'{loss.item():.4f}',
+                    'loss': f'{accumulated_loss:.4f}',
                     'lr': f'{current_lr:.2e}',
                     'eff_bs': gradient_accumulation_steps * dataloader.batch_size
                 })
+
+                if self.global_step % eval_steps == 0:
+                    eval_loss = self.evaluate(model, eval_dataloader)
+                    model.train()
+
+                    print(f"Epoch {epoch}, Step {actual_step}, Global Step {self.global_step}, "
+                            f"Eval Loss: {eval_loss:.4f}")
                 
                 if actual_step % 10 == 0:
-                    self.log_metrics(epoch, batch_idx, loss.item(), lr=current_lr)
-                    print(f"Epoch {epoch}, Step {actual_step}, Loss: {accumulated_loss:.4f}, LR: {current_lr:.2e}")
+                    self.log_metrics(epoch, actual_step, self.global_step, accumulated_loss, lr=current_lr, grad_norm=grad_norm.item())
+                    print(f"Epoch {epoch}, Step {actual_step}, Global Step {self.global_step}, "
+                            f"Loss: {accumulated_loss:.4f}, LR: {current_lr:.2e}, Grad Norm: {grad_norm.item():.3f}")
+
+                accumulated_loss = 0
         
         avg_loss = total_loss / len(dataloader) // gradient_accumulation_steps
         print(f"Epoch {epoch} Average Loss: {avg_loss:.4f}")
@@ -222,7 +237,7 @@ class SFTTrainingSetup:
     
     def train(self, dataset_path_or_name, output_dir="./sft_checkpoints", 
               num_epochs=3, batch_size=4, learning_rate=5e-5, use_hf=True, 
-              hf_repo_name=None, wandb_project="triton-sft"):
+              hf_repo_name=None, wandb_project="triton-sft", eval_steps=50):
         """Run SFT training"""
         
         if self.model is None:
@@ -268,34 +283,43 @@ class SFTTrainingSetup:
             eps=1e-8
         )
         
-        num_training_steps = len(train_dataloader) * num_epochs
-        warmup_steps = num_training_steps // 5
+        gradient_accumulation_steps = 2
+        steps_per_epoch = len(train_dataloader) // gradient_accumulation_steps
+        total_training_steps = steps_per_epoch * num_epochs
+        warmup_steps = int(0.1 * total_training_steps)
         
-        scheduler = torch.optim.lr_scheduler.LinearLR(
+        scheduler = get_cosine_schedule_with_warmup(
             optimizer,
-            start_factor=0.1,
-            end_factor=1.0,
-            total_iters=warmup_steps
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps
         )
         
         os.makedirs(output_dir, exist_ok=True)
         
         best_eval_loss = float('inf')
         for epoch in range(num_epochs):
-            train_loss = self.train_epoch(self.model, train_dataloader, optimizer, epoch + 1, gradient_accumulation_steps=4)
+            train_loss = self.train_epoch(
+                    self.model, 
+                    train_dataloader, 
+                    optimizer, 
+                    scheduler,
+                    epoch + 1, 
+                    eval_dataloader,
+                    eval_steps,
+                    gradient_accumulation_steps=2
+                )
             eval_loss = self.evaluate(self.model, eval_dataloader)
 
             wandb.log({
                 "epoch/train_loss": train_loss,
                 "epoch/eval_loss": eval_loss,
-                "epoch/number": epoch + 1
-            })
+                "epoch/number": epoch + 1,
+                "epoch/global_step": self.global_step
+            }, step=self.global_step)
 
             current_lr = optimizer.param_groups[0]['lr']
             self.log_metrics(epoch + 1, len(train_dataloader), train_loss, eval_loss, current_lr)
             
-            if epoch < warmup_steps // len(train_dataloader):
-                scheduler.step()
             
             if eval_loss < best_eval_loss:
                 best_eval_loss = eval_loss
@@ -389,7 +413,8 @@ if __name__ == "__main__":
         learning_rate=5e-5,
         use_hf=True,
         hf_repo_name="cdreetz/triton-sft-dataset",
-        wandb_project="triton-kernel-sft"
+        wandb_project="triton-kernel-sft",
+        eval_steps=50
     )
     
     test_prompt = "Can you implement an elementwise addition triton kernel? Write both the kernel method and the corresponding launch method."
