@@ -5,7 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
 from tqdm import tqdm
-
+from datasets import load_dataset
 
 class TritonDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=2048):
@@ -66,14 +66,28 @@ class SFTTrainingSetup:
         return self.model, self.tokenizer
     
     
-    def prepare_dataset(self, dataset_path):
+    def prepare_dataset(self, dataset_path_or_name, use_hf=True):
         """Prepare dataset for training"""
-        
-        with open(dataset_path, 'r') as f:
-            data = [json.loads(line.strip()) for line in f]
-        
+
+        if use_hf:
+            print(f"Loading dataset from {dataset_path_or_name}...")
+            hf_dataset = load_dataset(dataset_path_or_name, split="train")
+
+            data = []
+            for example in hf_dataset:
+                data.append({
+                    'instruction': example['prompt'],
+                    'response': example['completion'],
+                    'id': example.get('id', ''),
+                    'type': example.get('type', ''),
+                    'operation': example.get('operation', '')
+                })
+        else:
+            with open(dataset_path_or_name, 'r') as f:
+                data = [json.loads(line.strip()) for line in f]
+            
         print(f"Loaded {len(data)} examples")
-        
+
         train_size = int(0.9 * len(data))
         train_data = data[:train_size]
         eval_data = data[train_size:]
@@ -136,14 +150,14 @@ class SFTTrainingSetup:
         return avg_loss
     
     
-    def train(self, dataset_path, output_dir="./sft_checkpoints", 
-              num_epochs=3, batch_size=4, learning_rate=2e-4):
+    def train(self, dataset_path_or_name, output_dir="./sft_checkpoints", 
+              num_epochs=3, batch_size=4, learning_rate=2e-4, use_hf=True):
         """Run SFT training"""
         
         if self.model is None:
             self.load_model_and_tokenizer()
         
-        train_dataset, eval_dataset = self.prepare_dataset(dataset_path)
+        train_dataset, eval_dataset = self.prepare_dataset(dataset_path_or_name, use_hf)
         
         train_dataloader = DataLoader(
             train_dataset, 
@@ -246,11 +260,12 @@ if __name__ == "__main__":
     trainer_setup = SFTTrainingSetup()
     
     model = trainer_setup.train(
-        dataset_path="sft_executable_data.jsonl",
+        dataset_path_or_name="cdreetz/triton-sft-dataset",
         output_dir="./qwen_triton_sft",
         num_epochs=3,
         batch_size=2,  # Smaller batch size for 1.5B model
-        learning_rate=1e-4
+        learning_rate=1e-4,
+        use_hf=True
     )
     
     test_prompt = "Can you implement an elementwise addition triton kernel? Write both the kernel method and the corresponding launch method."
