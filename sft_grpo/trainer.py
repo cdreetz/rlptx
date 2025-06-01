@@ -1,11 +1,14 @@
 import json
+import csv
 import torch
+from datetime import datetime
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
 from tqdm import tqdm
 from datasets import load_dataset
+from huggingface_hub import HfApi, login
 
 class TritonDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=2048):
@@ -112,6 +115,39 @@ class SFTTrainingSetup:
         except Exception as e:
             print(f"Error uploading checkpoint to {repo_name}: {e}")
 
+    def setup_logging(self, output_dir):
+        self.log_dir = os.path.join(output_dir, "logs")
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        self.train_log_file = os.path.join(self.log_dir, "training_log.jsonl")
+        self.metrics_file = os.path.join(self.log_dir, "metrics.csv")
+
+        with open(self.metrics_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'epoch', 'step', 'train_loss', 'eval_loss', 'learning_rate'])
+
+        print(f"Logging to {self.log_dir}")
+
+    def log_metrics(self, epoch, step, train_loss, eval_loss=None, lr=None):
+        timestamp = datetime.now().isoformat()
+
+        log_entry = {
+            "timestamp": timestamp,
+            "epoch": epoch,
+            "step": step,
+            "train_loss": train_loss,
+            "eval_loss": eval_loss,
+            "learning_rate": lr
+        }
+
+        with open(self.train_log_file, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+
+        with open(self.metrics_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp, epoch, step, train_loss, eval_loss, lr])
+
+
     def train_epoch(self, model, dataloader, optimizer, epoch):
         """Train for one epoch"""
         model.train()
@@ -134,10 +170,20 @@ class SFTTrainingSetup:
             optimizer.step()
             
             total_loss += loss.item()
+            current_lr = optimizer.param_groups[0]['lr']
+
+            global_step = (epoch - 1) * len(dataloader) + batch_idx
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/learning_rate": current_lr,
+                "train/epoch": epoch,
+                "train/step": batch_idx
+            }, step=global_step)
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
             if batch_idx % 50 == 0:
+                self.log_metrics(epoch, batch_idx, loss.item(), lr=current_lr)
                 print(f"Epoch {epoch}, Step {batch_idx}, Loss: {loss.item():.4f}")
         
         avg_loss = total_loss / len(dataloader)
@@ -160,16 +206,32 @@ class SFTTrainingSetup:
         
         avg_loss = total_loss / len(dataloader)
         print(f"Eval Loss: {avg_loss:.4f}")
+
+        wandb.log({"eval/loss": avg_loss})
         return avg_loss
     
     
     def train(self, dataset_path_or_name, output_dir="./sft_checkpoints", 
-              num_epochs=3, batch_size=4, learning_rate=2e-4, use_hf=True, 
-              hf_repo_name=None):
+              num_epochs=3, batch_size=4, learning_rate=5e-5, use_hf=True, 
+              hf_repo_name=None, wandb_project="triton-sft"):
         """Run SFT training"""
         
         if self.model is None:
             self.load_model_and_tokenizer()
+
+        wandb.init(
+            project=wandb_project,
+            config={
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "num_epochs": num_epochs,
+                "model_name": self.model_name,
+                "dataset": dataset_path_or_name
+            }
+        )
+
+
+        self.setup_logging(output_dir)
 
         if hf_repo_name:
             print("Logging into HF")
@@ -193,11 +255,12 @@ class SFTTrainingSetup:
         optimizer = torch.optim.AdamW(
             self.model.parameters(), 
             lr=learning_rate,
-            weight_decay=0.01
+            weight_decay=0.01,
+            eps=1e-8
         )
         
         num_training_steps = len(train_dataloader) * num_epochs
-        warmup_steps = num_training_steps // 10
+        warmup_steps = num_training_steps // 5
         
         scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
@@ -212,6 +275,15 @@ class SFTTrainingSetup:
         for epoch in range(num_epochs):
             train_loss = self.train_epoch(self.model, train_dataloader, optimizer, epoch + 1)
             eval_loss = self.evaluate(self.model, eval_dataloader)
+
+            wandb.log({
+                "epoch/train_loss": train_loss,
+                "epoch/eval_loss": eval_loss,
+                "epoch/number": epoch + 1
+            })
+
+            current_lr = optimizer.param_groups[0]['lr']
+            self.log_metrics(epoch + 1, len(train_dataloader), train_loss, eval_loss, current_lr)
             
             if epoch < warmup_steps // len(train_dataloader):
                 scheduler.step()
@@ -250,6 +322,9 @@ class SFTTrainingSetup:
         
         print(f"Training completed! Best eval loss: {best_eval_loss:.4f}")
         print(f"Model saved to {output_dir}")
+
+        wandb.finish()
+        print(f"view training run at: {wandb.run.url}")
         
         return self.model
     
@@ -295,7 +370,6 @@ class SFTTrainingSetup:
 
 
 if __name__ == "__main__":
-    
     trainer_setup = SFTTrainingSetup()
     
     model = trainer_setup.train(
@@ -303,9 +377,10 @@ if __name__ == "__main__":
         output_dir="./qwen_triton_sft",
         num_epochs=3,
         batch_size=2,  # Smaller batch size for 1.5B model
-        learning_rate=1e-4,
+        learning_rate=5e-5,
         use_hf=True,
-        hf_repo_name="cdreetz/triton-sft-dataset"
+        hf_repo_name="cdreetz/triton-sft-dataset",
+        wandb_project="triton-kernel-sft"
     )
     
     test_prompt = "Can you implement an elementwise addition triton kernel? Write both the kernel method and the corresponding launch method."
