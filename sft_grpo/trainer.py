@@ -98,7 +98,20 @@ class SFTTrainingSetup:
         print(f"Train: {len(train_dataset)}, Eval: {len(eval_dataset)}")
         
         return train_dataset, eval_dataset
-    
+
+    def upload_checkpoint_to_hf(self, local_path, repo_name, commit_message="Training checkpoint"):
+        try:
+            api = HfApi()
+            api.upload_file(
+                folder_path=local_path,
+                repo_id=repo_name,
+                repo_type="model",
+                commit_message=commit_message,
+            )
+            print(f"Uploaded checkpoint to {repo_name}")
+        except Exception as e:
+            print(f"Error uploading checkpoint to {repo_name}: {e}")
+
     def train_epoch(self, model, dataloader, optimizer, epoch):
         """Train for one epoch"""
         model.train()
@@ -151,11 +164,16 @@ class SFTTrainingSetup:
     
     
     def train(self, dataset_path_or_name, output_dir="./sft_checkpoints", 
-              num_epochs=3, batch_size=4, learning_rate=2e-4, use_hf=True):
+              num_epochs=3, batch_size=4, learning_rate=2e-4, use_hf=True, 
+              hf_repo_name=None):
         """Run SFT training"""
         
         if self.model is None:
             self.load_model_and_tokenizer()
+
+        if hf_repo_name:
+            print("Logging into HF")
+            login()
         
         train_dataset, eval_dataset = self.prepare_dataset(dataset_path_or_name, use_hf)
         
@@ -202,12 +220,33 @@ class SFTTrainingSetup:
                 best_eval_loss = eval_loss
                 self.save_model(output_dir)
                 print(f"Saved new best model with eval loss: {eval_loss:.4f}")
+
+                if hf_repo_name:
+                    self.upload_checkpoint_to_hf(
+                        output_dir, 
+                        hf_repo_name, 
+                        f"Best model - epoch {epoch+1}, eval loss: {eval_loss:.4f}"
+                    )
             
             checkpoint_dir = os.path.join(output_dir, f"checkpoint-epoch-{epoch+1}")
             self.save_model(checkpoint_dir)
+
+            if hf_repo_name:
+                self.upload_checkpoint_to_hf(
+                    checkpoint_dir,
+                    hf_repo_name,
+                    f"Epoch {epoch+1} checkpoint - train_loss: {train_loss:.4f}, eval_loss: {eval_loss:.4f}"
+                )
             
             print(f"Epoch {epoch+1}/{num_epochs} completed")
             print("-" * 50)
+
+        if hf_repo_name:
+            self.upload_checkpoint_to_hf(
+                output_dir,
+                hf_repo_name,
+                f"Final model - epoch {num_epochs}, eval loss: {eval_loss:.4f}"
+            )
         
         print(f"Training completed! Best eval loss: {best_eval_loss:.4f}")
         print(f"Model saved to {output_dir}")
@@ -265,7 +304,8 @@ if __name__ == "__main__":
         num_epochs=3,
         batch_size=2,  # Smaller batch size for 1.5B model
         learning_rate=1e-4,
-        use_hf=True
+        use_hf=True,
+        hf_repo_name="cdreetz/triton-sft-dataset"
     )
     
     test_prompt = "Can you implement an elementwise addition triton kernel? Write both the kernel method and the corresponding launch method."
