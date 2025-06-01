@@ -9,6 +9,7 @@ import os
 from tqdm import tqdm
 from datasets import load_dataset
 from huggingface_hub import HfApi, login
+import wandb
 
 class TritonDataset(Dataset):
     def __init__(self, data, tokenizer, max_length=2048):
@@ -148,10 +149,11 @@ class SFTTrainingSetup:
             writer.writerow([timestamp, epoch, step, train_loss, eval_loss, lr])
 
 
-    def train_epoch(self, model, dataloader, optimizer, epoch):
+    def train_epoch(self, model, dataloader, optimizer, epoch, gradient_accumulation_steps=4):
         """Train for one epoch"""
         model.train()
         total_loss = 0
+        accumulated_loss = 0
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
         for batch_idx, batch in enumerate(pbar):
@@ -160,33 +162,40 @@ class SFTTrainingSetup:
             labels = batch['labels'].to(self.device)
             
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            
-            optimizer.zero_grad()
+            loss = outputs.loss / gradient_accumulation_steps
             loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
-            total_loss += loss.item()
-            current_lr = optimizer.param_groups[0]['lr']
+            accumulated_loss += loss.item()
 
-            global_step = (epoch - 1) * len(dataloader) + batch_idx
-            wandb.log({
-                "train/loss": loss.item(),
-                "train/learning_rate": current_lr,
-                "train/epoch": epoch,
-                "train/step": batch_idx
-            }, step=global_step)
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-            if batch_idx % 50 == 0:
-                self.log_metrics(epoch, batch_idx, loss.item(), lr=current_lr)
-                print(f"Epoch {epoch}, Step {batch_idx}, Loss: {loss.item():.4f}")
+            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+                total_loss += accumulated_loss
+                current_lr = optimizer.param_groups[0]['lr']
+
+                actual_step = (batch_idx + 1) // gradient_accumulation_steps
+                global_step = (epoch - 1) * (len(dataloader) // gradient_accumulation_steps) + actual_step
+
+
+                wandb.log({
+                    "train/loss": accumulated_loss,
+                    "train/learning_rate": current_lr,
+                    "train/epoch": epoch,
+                    "train/step": actual_step
+                }, step=global_step)
+                
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'lr': f'{current_lr:.2e}',
+                    'eff_bs': gradient_accumulation_steps * dataloader.batch_size
+                })
+                
+                if actual_step % 10 == 0:
+                    self.log_metrics(epoch, batch_idx, loss.item(), lr=current_lr)
+                    print(f"Epoch {epoch}, Step {actual_step}, Loss: {accumulated_loss:.4f}, LR: {current_lr:.2e}")
         
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / len(dataloader) // gradient_accumulation_steps
         print(f"Epoch {epoch} Average Loss: {avg_loss:.4f}")
         return avg_loss
     
@@ -273,7 +282,7 @@ class SFTTrainingSetup:
         
         best_eval_loss = float('inf')
         for epoch in range(num_epochs):
-            train_loss = self.train_epoch(self.model, train_dataloader, optimizer, epoch + 1)
+            train_loss = self.train_epoch(self.model, train_dataloader, optimizer, epoch + 1, gradient_accumulation_steps=4)
             eval_loss = self.evaluate(self.model, eval_dataloader)
 
             wandb.log({
